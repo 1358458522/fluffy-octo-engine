@@ -1,0 +1,21 @@
+# macOS / Xcode
+build/
+DerivedData/
+*.xcuserstate
+xcuserdata/
+*.xcodeproj/xcuserdata/
+*.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/
+
+# 由 xcodegen 生成，不入库
+TTYB.xcodeproj/
+Resources/Info.plist
+
+# Python
+__pycache__/
+*.pyc
+
+# 绝不允许入库的敏感文件
+*.gasenc
+config.pkg
+mobile_config.json
+*.ipa

@@ -1,0 +1,74 @@
+name: Build unsigned IPA
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show Xcode version
+        run: xcodebuild -version
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        run: xcodegen generate
+
+      - name: Resolve Swift packages
+        run: |
+          xcodebuild -project TTYB.xcodeproj -scheme TTYB \
+            -resolvePackageDependencies
+
+      - name: Build (unsigned)
+        run: |
+          xcodebuild build \
+            -project TTYB.xcodeproj \
+            -scheme TTYB \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGN_ENTITLEMENTS=""
+
+      - name: Package unsigned IPA
+        run: |
+          set -e
+          APP_PATH="build/Build/Products/Release-iphoneos/TTYB.app"
+          if [ ! -d "$APP_PATH" ]; then
+            APP_PATH=$(find build/Build/Products -maxdepth 3 -name "*.app" -type d | head -n 1)
+          fi
+          echo "APP: $APP_PATH"
+          rm -rf Payload TTYB-unsigned.ipa
+          mkdir -p Payload
+          cp -R "$APP_PATH" Payload/
+          zip -qry TTYB-unsigned.ipa Payload
+          ls -lh TTYB-unsigned.ipa
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: TTYB-unsigned-ipa
+          path: TTYB-unsigned.ipa
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: |
+            build/**/*.xcactivitylog
+          if-no-files-found: ignore

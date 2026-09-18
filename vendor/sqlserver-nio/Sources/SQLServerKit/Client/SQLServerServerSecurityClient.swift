@@ -1,0 +1,510 @@
+import Foundation
+import NIO
+import SQLServerTDS
+
+// MARK: - Server-scoped Security Client
+
+public final class SQLServerServerSecurityClient: @unchecked Sendable {
+    private enum Backing {
+        case connection(SQLServerConnection)
+        case client(SQLServerClient)
+    }
+    private let backing: Backing
+
+    public convenience init(connection: SQLServerConnection) {
+        self.init(backing: .connection(connection))
+    }
+    public convenience init(client: SQLServerClient) {
+        self.init(backing: .client(client))
+    }
+    private init(backing: Backing) { self.backing = backing }
+
+    // MARK: - Logins
+    internal func listLogins(includeDisabled: Bool = true, includeSystemLogins: Bool = false) -> EventLoopFuture<[ServerLoginInfo]> {
+        run(sql: {
+            var sql = """
+            SELECT sp.name,
+                   sp.type_desc,
+                   sp.is_disabled,
+                   sp.default_database_name,
+                   sp.default_language_name,
+                   sl.is_policy_checked,
+                   sl.is_expiration_checked
+            FROM sys.server_principals sp
+            LEFT JOIN sys.sql_logins sl ON sl.principal_id = sp.principal_id
+            WHERE sp.type IN ('S', 'U', 'G', 'C', 'K', 'E')
+            """
+            if !includeDisabled { sql += " AND sp.is_disabled = 0" }
+            if !includeSystemLogins {
+                sql += " AND sp.name NOT LIKE '##%##'"
+            }
+            sql += " ORDER BY sp.name"
+            return sql
+        }()).map { rows in
+            rows.compactMap { row -> ServerLoginInfo? in
+                let name = row.column("name")?.string ?? ""
+                let typeDesc = row.column("type_desc")?.string ?? ""
+                let disabled = (row.column("is_disabled")?.int ?? 0) == 1
+                let defDb = row.column("default_database_name")?.string
+                let defLang = row.column("default_language_name")?.string
+                let policyChecked = row.column("is_policy_checked")?.int.map { $0 == 1 }
+                let expirationChecked = row.column("is_expiration_checked")?.int.map { $0 == 1 }
+                let type: ServerLoginType
+                switch typeDesc {
+                case "SQL_LOGIN": type = .sql
+                case "WINDOWS_LOGIN": type = .windowsUser
+                case "WINDOWS_GROUP": type = .windowsGroup
+                case "CERTIFICATE_MAPPED_LOGIN": type = .certificate
+                case "ASYMMETRIC_KEY_MAPPED_LOGIN": type = .asymmetricKey
+                case "EXTERNAL_LOGIN": type = .external
+                default: type = .sql
+                }
+                return ServerLoginInfo(name: name, type: type, isDisabled: disabled, defaultDatabase: defDb, defaultLanguage: defLang, isPolicyChecked: policyChecked, isExpirationChecked: expirationChecked)
+            }
+        }
+    }
+
+    internal func currentLoginName() -> EventLoopFuture<String> {
+        run(sql: "SELECT SUSER_SNAME() AS name").flatMapThrowing { rows in
+            guard let name = rows.first?.column("name")?.string else {
+                throw SQLServerError.sqlExecutionError(message: "Could not fetch current login name")
+            }
+            return name
+        }
+    }
+
+    @available(macOS 12.0, *)
+    public func currentLoginName() async throws -> String {
+        try await currentLoginName().get()
+    }
+
+    /// Map a login to a database by creating a user in the target database.
+    internal func mapLoginToDatabase(login: String, database: String, userName: String? = nil, defaultSchema: String? = nil) -> EventLoopFuture<Void> {
+        let user = userName ?? login
+        var sql = "USE [\(escapeIdentifier(database))]; CREATE USER [\(escapeIdentifier(user))] FOR LOGIN [\(escapeIdentifier(login))]"
+        if let schema = defaultSchema {
+            sql += " WITH DEFAULT_SCHEMA = [\(escapeIdentifier(schema))]"
+        }
+        sql += ";"
+        return exec(sql: sql).map { _ in () }
+    }
+
+    /// List databases a login is mapped to (has a user in).
+    internal func listLoginDatabaseMappings(login: String) -> EventLoopFuture<[LoginDatabaseMapping]> {
+        let loginLit = escapeLiteral(login)
+        let sql = """
+        DECLARE @results TABLE (db_name sysname, user_name sysname, default_schema sysname NULL);
+        DECLARE @db sysname;
+        DECLARE cur CURSOR FAST_FORWARD FOR
+        SELECT name FROM sys.databases WHERE state = 0;
+        OPEN cur; FETCH NEXT FROM cur INTO @db;
+        WHILE @@FETCH_STATUS = 0 BEGIN
+            DECLARE @sql nvarchar(max) = N'USE ' + QUOTENAME(@db) + N';
+                INSERT INTO @results
+                SELECT DB_NAME(), dp.name, dp.default_schema_name
+                FROM sys.database_principals dp
+                WHERE dp.sid = SUSER_SID(N''\(loginLit)'')
+                AND dp.type IN (''S'',''U'',''G'');';
+            BEGIN TRY EXEC sp_executesql @sql; END TRY BEGIN CATCH END CATCH;
+            FETCH NEXT FROM cur INTO @db;
+        END; CLOSE cur; DEALLOCATE cur;
+        SELECT db_name, user_name, default_schema FROM @results ORDER BY db_name;
+        """
+        return run(sql: sql).map { rows in
+            rows.compactMap { row -> LoginDatabaseMapping? in
+                guard let dbName = row.column("db_name")?.string,
+                      let userName = row.column("user_name")?.string else { return nil }
+                return LoginDatabaseMapping(
+                    databaseName: dbName,
+                    userName: userName,
+                    defaultSchema: row.column("default_schema")?.string
+                )
+            }
+        }
+    }
+
+    /// Remove a login's user mapping from a database.
+    internal func unmapLoginFromDatabase(login: String, database: String, userName: String? = nil) -> EventLoopFuture<Void> {
+        let user = userName ?? login
+        let sql = "USE [\(escapeIdentifier(database))]; DROP USER [\(escapeIdentifier(user))];"
+        return exec(sql: sql).map { _ in () }
+    }
+
+    internal func createSqlLogin(name: String, password: String, options: LoginOptions = .init()) -> EventLoopFuture<Void> {
+        exec(sql: buildCreateSqlLogin(name: name, password: password, options: options)).map { _ in () }
+    }
+
+    internal func createWindowsLogin(name: String) -> EventLoopFuture<Void> {
+        let sql = "CREATE LOGIN [\(escapeIdentifier(name))] FROM WINDOWS;"
+        return exec(sql: sql).map { _ in () }
+    }
+
+    // MARK: - Additional login types
+    internal func createCertificateLogin(name: String, certificateName: String, defaultDatabase: String? = nil, defaultLanguage: String? = nil) -> EventLoopFuture<Void> {
+        var sql = "CREATE LOGIN [\(escapeIdentifier(name))] FROM CERTIFICATE [\(escapeIdentifier(certificateName))]"
+        var withs: [String] = []
+        if let db = defaultDatabase { withs.append("DEFAULT_DATABASE = [\(escapeIdentifier(db))]") }
+        if let lang = defaultLanguage { withs.append("DEFAULT_LANGUAGE = [\(escapeIdentifier(lang))]") }
+        if !withs.isEmpty { sql += " WITH \(withs.joined(separator: ", "))" }
+        sql += ";"
+        return exec(sql: sql).map { _ in () }
+    }
+
+    internal func createAsymmetricKeyLogin(name: String, asymmetricKeyName: String, defaultDatabase: String? = nil, defaultLanguage: String? = nil) -> EventLoopFuture<Void> {
+        var sql = "CREATE LOGIN [\(escapeIdentifier(name))] FROM ASYMMETRIC KEY [\(escapeIdentifier(asymmetricKeyName))]"
+        var withs: [String] = []
+        if let db = defaultDatabase { withs.append("DEFAULT_DATABASE = [\(escapeIdentifier(db))]") }
+        if let lang = defaultLanguage { withs.append("DEFAULT_LANGUAGE = [\(escapeIdentifier(lang))]") }
+        if !withs.isEmpty { sql += " WITH \(withs.joined(separator: ", "))" }
+        sql += ";"
+        return exec(sql: sql).map { _ in () }
+    }
+
+    internal func createExternalLogin(name: String) -> EventLoopFuture<Void> {
+        // Azure AD / external provider login
+        let sql = "CREATE LOGIN [\(escapeIdentifier(name))] FROM EXTERNAL PROVIDER;"
+        return exec(sql: sql).map { _ in () }
+    }
+
+    internal func enableLogin(name: String, enabled: Bool) -> EventLoopFuture<Void> {
+        let sql = "ALTER LOGIN [\(escapeIdentifier(name))] \(enabled ? "ENABLE" : "DISABLE");"
+        return exec(sql: sql).map { _ in () }
+    }
+
+    internal func setLoginPassword(name: String, newPassword: String, oldPassword: String? = nil, mustChange: Bool? = nil) -> EventLoopFuture<Void> {
+        // Per T-SQL grammar, OLD_PASSWORD and MUST_CHANGE are part of the PASSWORD clause
+        // and are not separated by commas. Example:
+        // ALTER LOGIN [name] WITH PASSWORD = N'new' OLD_PASSWORD = N'old' MUST_CHANGE;
+        var sql = "ALTER LOGIN [\(escapeIdentifier(name))] WITH PASSWORD = N'\(escapeLiteral(newPassword))'"
+        if let old = oldPassword { sql += " OLD_PASSWORD = N'\(escapeLiteral(old))'" }
+        if let mc = mustChange, mc { sql += " MUST_CHANGE" }
+        sql += ";"
+        return exec(sql: sql).map { _ in () }
+    }
+
+    internal func alterLogin(name: String, options: LoginAlterOptions) -> EventLoopFuture<Void> {
+        var parts: [String] = []
+        if let db = options.defaultDatabase { parts.append("DEFAULT_DATABASE = [\(escapeIdentifier(db))]") }
+        if let lang = options.defaultLanguage { parts.append("DEFAULT_LANGUAGE = [\(escapeIdentifier(lang))]") }
+        if let cp = options.checkPolicy { parts.append("CHECK_POLICY = \(cp ? "ON" : "OFF")") }
+        if let ce = options.checkExpiration { parts.append("CHECK_EXPIRATION = \(ce ? "ON" : "OFF")") }
+        guard !parts.isEmpty else { return futureSucceeded(()) }
+        let sql = "ALTER LOGIN [\(escapeIdentifier(name))] WITH \(parts.joined(separator: ", "));"
+        return exec(sql: sql).map { _ in () }
+    }
+
+    internal func dropLogin(name: String, dropMappedUsers: Bool = false) -> EventLoopFuture<Void> {
+        // Best-effort: optionally drop mapped users across databases (requires high privileges)
+        let loginName = escapeLiteral(name)
+        let pre: String = dropMappedUsers ? """
+        DECLARE @db sysname;
+        DECLARE cur CURSOR FAST_FORWARD FOR
+        SELECT name FROM sys.databases WHERE state = 0 AND database_id > 4;
+        OPEN cur; FETCH NEXT FROM cur INTO @db;
+        WHILE @@FETCH_STATUS = 0 BEGIN
+            DECLARE @sql nvarchar(max) = N'USE ' + QUOTENAME(@db) + N';
+                DECLARE @u sysname; DECLARE c CURSOR FAST_FORWARD FOR
+                SELECT name FROM sys.database_principals WHERE sid = SUSER_SID(N'\(loginName)');
+                OPEN c; FETCH NEXT FROM c INTO @u; WHILE @@FETCH_STATUS = 0 BEGIN
+                    BEGIN TRY EXEC(N'DROP USER ' + QUOTENAME(@u)); END TRY BEGIN CATCH END CATCH;
+                    FETCH NEXT FROM c INTO @u; END; CLOSE c; DEALLOCATE c;';
+            EXEC sp_executesql @sql; FETCH NEXT FROM cur INTO @db; END; CLOSE cur; DEALLOCATE cur;
+        """ : ""
+        let sql = pre + "DROP LOGIN [\(escapeIdentifier(name))];"
+        return exec(sql: sql).map { _ in () }
+    }
+
+    // Options
+    public struct LoginOptions: Sendable {
+        public var defaultDatabase: String?
+        public var defaultLanguage: String?
+        public var checkPolicy: Bool? = nil
+        public var checkExpiration: Bool? = nil
+        public var sid: Data? = nil
+        public var mustChange: Bool? = nil
+        public init(defaultDatabase: String? = nil, defaultLanguage: String? = nil, checkPolicy: Bool? = nil, checkExpiration: Bool? = nil, sid: Data? = nil, mustChange: Bool? = nil) {
+            self.defaultDatabase = defaultDatabase
+            self.defaultLanguage = defaultLanguage
+            self.checkPolicy = checkPolicy
+            self.checkExpiration = checkExpiration
+            self.sid = sid
+            self.mustChange = mustChange
+        }
+    }
+
+    public struct LoginAlterOptions: Sendable {
+        public var defaultDatabase: String?
+        public var defaultLanguage: String?
+        public var checkPolicy: Bool?
+        public var checkExpiration: Bool?
+        public init(defaultDatabase: String? = nil, defaultLanguage: String? = nil, checkPolicy: Bool? = nil, checkExpiration: Bool? = nil) {
+            self.defaultDatabase = defaultDatabase
+            self.defaultLanguage = defaultLanguage
+            self.checkPolicy = checkPolicy
+            self.checkExpiration = checkExpiration
+        }
+    }
+
+    // MARK: - Server roles
+    internal func listServerRoles() -> EventLoopFuture<[ServerRoleInfo]> {
+        run(sql: """
+            SELECT name, is_fixed_role = CASE WHEN is_fixed_role = 1 THEN 1 ELSE 0 END
+            FROM sys.server_principals WHERE type = 'R' ORDER BY name
+        """).map { rows in
+            rows.map { row in
+                ServerRoleInfo(name: row.column("name")?.string ?? "", isFixed: (row.column("is_fixed_role")?.int ?? 0) == 1)
+            }
+        }
+    }
+
+    internal func createServerRole(name: String) -> EventLoopFuture<Void> {
+        exec(sql: "CREATE SERVER ROLE [\(escapeIdentifier(name))];").map { _ in () }
+    }
+    internal func alterServerRole(name: String, newName: String?) -> EventLoopFuture<Void> {
+        guard let nn = newName, !nn.isEmpty else { return futureSucceeded(()) }
+        return exec(sql: "ALTER SERVER ROLE [\(escapeIdentifier(name))] WITH NAME = [\(escapeIdentifier(nn))];").map { _ in () }
+    }
+    internal func dropServerRole(name: String) -> EventLoopFuture<Void> {
+        exec(sql: "DROP SERVER ROLE [\(escapeIdentifier(name))];").map { _ in () }
+    }
+    internal func addMemberToServerRole(role: String, principal: String) -> EventLoopFuture<Void> {
+        exec(sql: "ALTER SERVER ROLE [\(escapeIdentifier(role))] ADD MEMBER [\(escapeIdentifier(principal))];").map { _ in () }
+    }
+    internal func removeMemberFromServerRole(role: String, principal: String) -> EventLoopFuture<Void> {
+        exec(sql: "ALTER SERVER ROLE [\(escapeIdentifier(role))] DROP MEMBER [\(escapeIdentifier(principal))];").map { _ in () }
+    }
+    internal func listServerRoleMembers(role: String) -> EventLoopFuture<[String]> {
+        run(sql: """
+            SELECT spm.name AS member_name
+            FROM sys.server_role_members m
+            JOIN sys.server_principals spr ON spr.principal_id = m.role_principal_id
+            JOIN sys.server_principals spm ON spm.principal_id = m.member_principal_id
+            WHERE spr.name = N'\(escapeLiteral(role))'
+            ORDER BY spm.name
+        """).map { rows in rows.compactMap { $0.column("member_name")?.string } }
+    }
+    internal func listServerRolesForPrincipal(principal: String) -> EventLoopFuture<[String]> {
+        run(sql: """
+            SELECT spr.name AS role_name
+            FROM sys.server_role_members m
+            JOIN sys.server_principals spr ON spr.principal_id = m.role_principal_id
+            JOIN sys.server_principals spm ON spm.principal_id = m.member_principal_id
+            WHERE spm.name = N'\(escapeLiteral(principal))'
+            ORDER BY spr.name
+        """).map { rows in rows.compactMap { $0.column("role_name")?.string } }
+    }
+
+    // MARK: - Server permissions
+    internal func grant(permission: ServerPermissionName, to principal: String, withGrantOption: Bool = false) -> EventLoopFuture<Void> {
+        var sql = "GRANT \(permission.rawValue) TO [\(escapeIdentifier(principal))]"
+        if withGrantOption { sql += " WITH GRANT OPTION" }
+        sql += ";"
+        return exec(sql: sql).map { _ in () }
+    }
+    internal func revoke(permission: ServerPermissionName, from principal: String, cascade: Bool = false) -> EventLoopFuture<Void> {
+        var sql = "REVOKE \(permission.rawValue) FROM [\(escapeIdentifier(principal))]"
+        if cascade { sql += " CASCADE" }
+        sql += ";"
+        return exec(sql: sql).map { _ in () }
+    }
+    internal func deny(permission: ServerPermissionName, to principal: String) -> EventLoopFuture<Void> {
+        let sql = "DENY \(permission.rawValue) TO [\(escapeIdentifier(principal))];"
+        return exec(sql: sql).map { _ in () }
+    }
+    public struct ServerPermissionInfo: Sendable {
+        public let permission: String
+        public let state: String
+        public let principalName: String
+        public let grantor: String?
+    }
+    internal func listPermissions(principal: String? = nil) -> EventLoopFuture<[ServerPermissionInfo]> {
+        var sql = """
+        SELECT p.permission_name, p.state_desc, grantee.name AS principal_name, grantor.name AS grantor_name
+        FROM sys.server_permissions p
+        JOIN sys.server_principals grantee ON grantee.principal_id = p.grantee_principal_id
+        LEFT JOIN sys.server_principals grantor ON grantor.principal_id = p.grantor_principal_id
+        WHERE 1=1
+        """
+        if let pr = principal { sql += " AND grantee.name = N'\(escapeLiteral(pr))'" }
+        sql += " ORDER BY grantee.name, p.permission_name"
+        return run(sql: sql).map { rows in
+            rows.map { r in
+                ServerPermissionInfo(
+                    permission: r.column("permission_name")?.string ?? "",
+                    state: r.column("state_desc")?.string ?? "",
+                    principalName: r.column("principal_name")?.string ?? "",
+                    grantor: r.column("grantor_name")?.string
+                )
+            }
+        }
+    }
+
+    // MARK: - Credentials
+    public struct CredentialInfo: Sendable {
+        public let name: String
+        public let identity: String?
+    }
+    internal func listCredentials() -> EventLoopFuture<[CredentialInfo]> {
+        run(sql: "SELECT name, credential_identity FROM sys.credentials ORDER BY name").map { rows in
+            rows.map { r in CredentialInfo(name: r.column("name")?.string ?? "", identity: r.column("credential_identity")?.string) }
+        }
+    }
+    internal func createCredential(name: String, identity: String, secret: String) -> EventLoopFuture<Void> {
+        let sql = "CREATE CREDENTIAL [\(escapeIdentifier(name))] WITH IDENTITY = N'\(escapeLiteral(identity))', SECRET = N'\(escapeLiteral(secret))';"
+        return exec(sql: sql).map { _ in () }
+    }
+    internal func alterCredential(name: String, identity: String?, secret: String?) -> EventLoopFuture<Void> {
+        var parts: [String] = []
+        if let id = identity { parts.append("IDENTITY = N'\(escapeLiteral(id))'") }
+        if let s = secret { parts.append("SECRET = N'\(escapeLiteral(s))'") }
+        guard !parts.isEmpty else { return futureSucceeded(()) }
+        let sql = "ALTER CREDENTIAL [\(escapeIdentifier(name))] WITH \(parts.joined(separator: ", "));"
+        return exec(sql: sql).map { _ in () }
+    }
+    internal func dropCredential(name: String) -> EventLoopFuture<Void> {
+        exec(sql: "DROP CREDENTIAL [\(escapeIdentifier(name))];").map { _ in () }
+    }
+
+    /// List all database roles in a specific database, with membership status for a given user.
+    internal func listDatabaseRolesForUser(database: String, userName: String) -> EventLoopFuture<[DatabaseUserRoleMembership]> {
+        let userLit = escapeLiteral(userName)
+        let sql = """
+        USE [\(escapeIdentifier(database))];
+        SELECT r.name AS role_name,
+               CASE WHEN rm.member_principal_id IS NOT NULL THEN 1 ELSE 0 END AS is_member
+        FROM sys.database_principals r
+        LEFT JOIN sys.database_role_members rm
+            ON rm.role_principal_id = r.principal_id
+            AND rm.member_principal_id = (SELECT principal_id FROM sys.database_principals WHERE name = N'\(userLit)')
+        WHERE r.type = 'R' AND r.is_fixed_role = 1
+        ORDER BY r.name;
+        """
+        return run(sql: sql).map { rows in
+            rows.compactMap { row -> DatabaseUserRoleMembership? in
+                guard let roleName = row.column("role_name")?.string else { return nil }
+                let isMember = row.column("is_member")?.int == 1
+                return DatabaseUserRoleMembership(roleName: roleName, isMember: isMember)
+            }
+        }
+    }
+
+    /// Add a user to a database role.
+    internal func addUserToDatabaseRole(database: String, userName: String, role: String) -> EventLoopFuture<Void> {
+        let sql = "USE [\(escapeIdentifier(database))]; ALTER ROLE [\(escapeIdentifier(role))] ADD MEMBER [\(escapeIdentifier(userName))];"
+        return exec(sql: sql).map { _ in () }
+    }
+
+    /// Remove a user from a database role.
+    internal func removeUserFromDatabaseRole(database: String, userName: String, role: String) -> EventLoopFuture<Void> {
+        let sql = "USE [\(escapeIdentifier(database))]; ALTER ROLE [\(escapeIdentifier(role))] DROP MEMBER [\(escapeIdentifier(userName))];"
+        return exec(sql: sql).map { _ in () }
+    }
+
+    // MARK: - Async convenience
+    @available(macOS 12.0, *)
+    public func listLogins(includeDisabled: Bool = true, includeSystemLogins: Bool = false) async throws -> [ServerLoginInfo] { try await listLogins(includeDisabled: includeDisabled, includeSystemLogins: includeSystemLogins).get() }
+    @available(macOS 12.0, *)
+    public func mapLoginToDatabase(login: String, database: String, userName: String? = nil, defaultSchema: String? = nil) async throws { _ = try await mapLoginToDatabase(login: login, database: database, userName: userName, defaultSchema: defaultSchema).get() }
+    @available(macOS 12.0, *)
+    public func listLoginDatabaseMappings(login: String) async throws -> [LoginDatabaseMapping] { try await listLoginDatabaseMappings(login: login).get() }
+    @available(macOS 12.0, *)
+    public func unmapLoginFromDatabase(login: String, database: String, userName: String? = nil) async throws { _ = try await unmapLoginFromDatabase(login: login, database: database, userName: userName).get() }
+    @available(macOS 12.0, *)
+    public func createSqlLogin(name: String, password: String, options: LoginOptions = .init()) async throws { _ = try await createSqlLogin(name: name, password: password, options: options).get() }
+    @available(macOS 12.0, *)
+    public func createWindowsLogin(name: String) async throws { _ = try await createWindowsLogin(name: name).get() }
+    @available(macOS 12.0, *)
+    public func createCertificateLogin(name: String, certificateName: String, defaultDatabase: String? = nil, defaultLanguage: String? = nil) async throws { _ = try await createCertificateLogin(name: name, certificateName: certificateName, defaultDatabase: defaultDatabase, defaultLanguage: defaultLanguage).get() }
+    @available(macOS 12.0, *)
+    public func createAsymmetricKeyLogin(name: String, asymmetricKeyName: String, defaultDatabase: String? = nil, defaultLanguage: String? = nil) async throws { _ = try await createAsymmetricKeyLogin(name: name, asymmetricKeyName: asymmetricKeyName, defaultDatabase: defaultDatabase, defaultLanguage: defaultLanguage).get() }
+    @available(macOS 12.0, *)
+    public func createExternalLogin(name: String) async throws { _ = try await createExternalLogin(name: name).get() }
+    @available(macOS 12.0, *)
+    public func enableLogin(name: String, enabled: Bool) async throws { _ = try await enableLogin(name: name, enabled: enabled).get() }
+    @available(macOS 12.0, *)
+    public func setLoginPassword(name: String, newPassword: String, oldPassword: String? = nil, mustChange: Bool? = nil) async throws { _ = try await setLoginPassword(name: name, newPassword: newPassword, oldPassword: oldPassword, mustChange: mustChange).get() }
+    @available(macOS 12.0, *)
+    public func alterLogin(name: String, options: LoginAlterOptions) async throws { _ = try await alterLogin(name: name, options: options).get() }
+    @available(macOS 12.0, *)
+    public func dropLogin(name: String, dropMappedUsers: Bool = false) async throws { _ = try await dropLogin(name: name, dropMappedUsers: dropMappedUsers).get() }
+    @available(macOS 12.0, *)
+    public func listServerRoles() async throws -> [ServerRoleInfo] { try await listServerRoles().get() }
+    @available(macOS 12.0, *)
+    public func createServerRole(name: String) async throws { _ = try await createServerRole(name: name).get() }
+    @available(macOS 12.0, *)
+    public func alterServerRole(name: String, newName: String?) async throws { _ = try await alterServerRole(name: name, newName: newName).get() }
+    @available(macOS 12.0, *)
+    public func dropServerRole(name: String) async throws { _ = try await dropServerRole(name: name).get() }
+    @available(macOS 12.0, *)
+    public func addMemberToServerRole(role: String, principal: String) async throws { _ = try await addMemberToServerRole(role: role, principal: principal).get() }
+    @available(macOS 12.0, *)
+    public func removeMemberFromServerRole(role: String, principal: String) async throws { _ = try await removeMemberFromServerRole(role: role, principal: principal).get() }
+    @available(macOS 12.0, *)
+    public func listServerRoleMembers(role: String) async throws -> [String] { try await listServerRoleMembers(role: role).get() }
+    @available(macOS 12.0, *)
+    public func listServerRolesForPrincipal(principal: String) async throws -> [String] { try await listServerRolesForPrincipal(principal: principal).get() }
+    @available(macOS 12.0, *)
+    public func grant(permission: ServerPermissionName, to principal: String, withGrantOption: Bool = false) async throws { _ = try await grant(permission: permission, to: principal, withGrantOption: withGrantOption).get() }
+    @available(macOS 12.0, *)
+    public func revoke(permission: ServerPermissionName, from principal: String, cascade: Bool = false) async throws { _ = try await revoke(permission: permission, from: principal, cascade: cascade).get() }
+    @available(macOS 12.0, *)
+    public func deny(permission: ServerPermissionName, to principal: String) async throws { _ = try await deny(permission: permission, to: principal).get() }
+    @available(macOS 12.0, *)
+    public func listPermissions(principal: String? = nil) async throws -> [ServerPermissionInfo] { try await listPermissions(principal: principal).get() }
+    @available(macOS 12.0, *)
+    public func listCredentials() async throws -> [CredentialInfo] { try await listCredentials().get() }
+    @available(macOS 12.0, *)
+    public func createCredential(name: String, identity: String, secret: String) async throws { _ = try await createCredential(name: name, identity: identity, secret: secret).get() }
+    @available(macOS 12.0, *)
+    public func alterCredential(name: String, identity: String?, secret: String?) async throws { _ = try await alterCredential(name: name, identity: identity, secret: secret).get() }
+    @available(macOS 12.0, *)
+    public func dropCredential(name: String) async throws { _ = try await dropCredential(name: name).get() }
+    @available(macOS 12.0, *)
+    public func listDatabaseRolesForUser(database: String, userName: String) async throws -> [DatabaseUserRoleMembership] { try await listDatabaseRolesForUser(database: database, userName: userName).get() }
+    @available(macOS 12.0, *)
+    public func addUserToDatabaseRole(database: String, userName: String, role: String) async throws { _ = try await addUserToDatabaseRole(database: database, userName: userName, role: role).get() }
+    @available(macOS 12.0, *)
+    public func removeUserFromDatabaseRole(database: String, userName: String, role: String) async throws { _ = try await removeUserFromDatabaseRole(database: database, userName: userName, role: role).get() }
+
+    // MARK: - Helpers
+    private func run(sql: String) -> EventLoopFuture<[SQLServerRow]> {
+        switch backing {
+        case .client(let c): return c.query(sql)
+        case .connection(let conn): return conn.query(sql)
+        }
+    }
+    private func exec(sql: String) -> EventLoopFuture<SQLServerExecutionResult> {
+        switch backing {
+        case .client(let c): return c.execute(sql)
+        case .connection(let conn): return conn.execute(sql)
+        }
+    }
+    private func futureSucceeded<T: Sendable>(_ value: T) -> EventLoopFuture<T> {
+        switch backing {
+        case .client(let c): return c.eventLoopGroup.next().makeSucceededFuture(value)
+        case .connection(let conn): return conn.eventLoop.makeSucceededFuture(value)
+        }
+    }
+    private func escapeIdentifier(_ identifier: String) -> String {
+        identifier.replacingOccurrences(of: "]", with: "]]" )
+    }
+    private func escapeLiteral(_ literal: String) -> String {
+        literal.replacingOccurrences(of: "'", with: "''")
+    }
+    private func buildCreateSqlLogin(name: String, password: String, options: LoginOptions) -> String {
+        // MUST_CHANGE is a flag associated with the PASSWORD option and should not use = ON/OFF
+        // nor be separated from PASSWORD by a comma.
+        var sql = "CREATE LOGIN [\(escapeIdentifier(name))] WITH PASSWORD = N'\(escapeLiteral(password))'"
+        if let mc = options.mustChange, mc { sql += " MUST_CHANGE" }
+
+        var trailing: [String] = []
+        if let defDb = options.defaultDatabase { trailing.append("DEFAULT_DATABASE = [\(escapeIdentifier(defDb))]") }
+        if let defLang = options.defaultLanguage { trailing.append("DEFAULT_LANGUAGE = [\(escapeIdentifier(defLang))]") }
+        if let cp = options.checkPolicy { trailing.append("CHECK_POLICY = \(cp ? "ON" : "OFF")") }
+        if let ce = options.checkExpiration { trailing.append("CHECK_EXPIRATION = \(ce ? "ON" : "OFF")") }
+        if let sid = options.sid { trailing.append("SID = 0x\(sid.map { String(format: "%02X", $0) }.joined())") }
+        if !trailing.isEmpty { sql += ", \(trailing.joined(separator: ", "))" }
+        sql += ";"
+        return sql
+    }
+}

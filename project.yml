@@ -14,8 +14,7 @@ settings:
 
 packages:
   SQLServerKit:
-    url: https://github.com/tashda/sqlserver-nio.git
-    exactVersion: 0.2.5
+    path: vendor/sqlserver-nio
 
 targets:
   TTYB:

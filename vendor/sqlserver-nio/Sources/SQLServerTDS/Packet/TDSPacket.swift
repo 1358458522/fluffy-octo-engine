@@ -1,0 +1,97 @@
+import NIO
+import Foundation
+
+/// Packet
+/// https://docs.microsoft.com/en-us/openspecs/windows_protocols/ms-tds/e5ea8520-1ea3-4a75-a2a9-c17e63e9ee19
+public struct TDSPacket: Sendable {
+    /// Packet Header
+    var header: Header! {
+        Header(from: buffer)
+    }
+    
+    let type: HeaderType
+    
+    public var messageBuffer: ByteBuffer {
+        buffer.getSlice(at: Header.length, length: buffer.readableBytes - Header.length)!
+    }
+    
+    /// Packet Data
+    internal var buffer: ByteBuffer
+    
+    init?(from buffer: inout ByteBuffer) {
+        guard buffer.readableBytes >= Header.length else {
+            return nil
+        }
+
+        // Read the packet header using readerIndex-relative offsets so that
+        // this works correctly in a while loop where readerIndex > 0 after
+        // previous packets have been consumed via readSlice().
+        let ri = buffer.readerIndex
+        guard
+            let typeByte: UInt8 = buffer.getInteger(at: ri),
+            let length: UInt16 = buffer.getInteger(at: ri + 2)
+        else {
+            return nil
+        }
+
+        let packetLength = Int(length)
+        guard packetLength >= TDSPacket.headerLength, buffer.readableBytes >= packetLength else {
+            return nil
+        }
+
+        guard let slice = buffer.readSlice(length: packetLength) else {
+            return nil
+        }
+
+        self.type = .init(integerLiteral: typeByte)
+        self.buffer = slice
+    }
+    
+    init<M: TDSMessagePayload>(message: M, allocator: ByteBufferAllocator) throws {
+        var buffer = allocator.buffer(capacity: 4_096)
+        
+        buffer.writeInteger(M.packetType.value)
+        buffer.writeInteger(0x00 as UInt8) // status
+        
+        // Skip length, it will be set later
+        buffer.moveWriterIndex(forwardBy: 2)
+        buffer.writeInteger(0x00 as UInt16) // SPID
+        buffer.writeInteger(0x01 as UInt8) // PacketID must start at 1
+        buffer.writeInteger(0x00 as UInt8) // Window
+        
+        try message.serialize(into: &buffer)
+        
+        // Update length
+        buffer.setInteger(UInt16(buffer.writerIndex), at: 2)
+        
+        self.type = M.packetType
+        self.buffer = buffer
+    }
+    
+    init(from inputBuffer: inout ByteBuffer, ofType type: HeaderType, isLastPacket: Bool, packetId: UInt8, allocator: ByteBufferAllocator) {
+        var buffer = allocator.buffer(capacity: inputBuffer.readableBytes + TDSPacket.headerLength)
+        
+        buffer.writeInteger(type.value)
+        buffer.writeInteger(isLastPacket ? TDSPacket.Status.eom.value : TDSPacket.Status.normal.value) // status
+        
+        // Skip length, it will be set later
+        buffer.moveWriterIndex(forwardBy: 2)
+        buffer.writeInteger(0x00 as UInt16) // SPID
+        buffer.writeInteger(packetId) // PacketID
+        buffer.writeInteger(0x00 as UInt8) // Window
+        
+        buffer.writeBuffer(&inputBuffer)
+        
+        // Update length
+        buffer.setInteger(UInt16(buffer.writerIndex), at: 2)
+        
+        self.type = type
+        self.buffer = buffer
+    }
+}
+
+extension TDSPacket {
+    public static let defaultPacketLength = 4096
+    public static let headerLength = 8
+    public static let maximumPacketDataLength = TDSPacket.defaultPacketLength - 8
+}

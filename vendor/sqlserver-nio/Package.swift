@@ -1,0 +1,62 @@
+// swift-tools-version:6.0
+import PackageDescription
+
+let package = Package(
+    name: "sqlserver-nio",
+    platforms: [
+        .macOS(.v10_15),
+        .iOS(.v13),
+    ],
+    products: [
+        .library(
+            name: "SQLServerKit",
+            targets: ["SQLServerKit"]),
+        .library(
+            name: "SQLServerKitTesting",
+            targets: ["SQLServerKitTesting"]),
+    ],
+    dependencies: [
+        .package(url: "https://github.com/apple/swift-nio.git", from: "2.65.0"),
+        .package(url: "https://github.com/apple/swift-nio-ssl.git", from: "2.26.0"),
+        .package(url: "https://github.com/apple/swift-log.git", from: "1.5.4"),
+        .package(url: "https://github.com/apple/swift-atomics.git", from: "1.2.0"),
+        .package(url: "https://github.com/apple/swift-collections.git", from: "1.1.0"),
+    ],
+    targets: [
+        .target(
+            name: "SQLServerTDS",
+            dependencies: [
+                .product(name: "NIOCore", package: "swift-nio"),
+                .product(name: "NIOPosix", package: "swift-nio"),
+                .product(name: "NIOSSL", package: "swift-nio-ssl"),
+                .product(name: "Logging", package: "swift-log"),
+                .product(name: "Atomics", package: "swift-atomics"),
+                .product(name: "Collections", package: "swift-collections"),
+            ],
+            path: "Sources/SQLServerTDS",
+            linkerSettings: [
+                .linkedFramework("GSS", .when(platforms: [.macOS])),
+            ]
+        ),
+        .target(
+            name: "SQLServerKit",
+            dependencies: [
+                "SQLServerTDS",
+                .product(name: "NIOCore", package: "swift-nio"),
+                .product(name: "NIOConcurrencyHelpers", package: "swift-nio"),
+                .product(name: "Logging", package: "swift-log"),
+            ],
+            path: "Sources/SQLServerKit"
+        ),
+        .target(
+            name: "SQLServerKitTesting",
+            dependencies: [
+                "SQLServerKit",
+                .product(name: "NIOCore", package: "swift-nio"),
+                .product(name: "NIOPosix", package: "swift-nio"),
+                .product(name: "NIOEmbedded", package: "swift-nio"),
+            ],
+            path: "Sources/SQLServerKitTesting"
+        )
+    ]
+)

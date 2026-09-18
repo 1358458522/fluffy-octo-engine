@@ -1,5 +1,5 @@
 import Foundation
-import SQLServerNIO
+import SQLServerKit
 
 /// 关键改点提示：
 /// 若 CI 编译报错并指向下面 Configuration 初始化里的 `tlsConfiguration:`，

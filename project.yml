@@ -13,9 +13,9 @@ settings:
     SWIFT_VERSION: "5.9"
 
 packages:
-  SQLServerNIO:
+  SQLServerKit:
     url: https://github.com/tashda/sqlserver-nio.git
-    from: 0.1.0
+    exactVersion: 0.2.5
 
 targets:
   TTYB:
@@ -46,5 +46,5 @@ targets:
         CODE_SIGN_IDENTITY: ""
         DEVELOPMENT_TEAM: ""
     dependencies:
-      - package: SQLServerNIO
-        product: SQLServerNIO
+      - package: SQLServerKit
+        product: SQLServerKit

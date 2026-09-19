@@ -58,9 +58,6 @@ struct HomeView: View {
             }
             .safeAreaInset(edge: .bottom) { bottomBar }
             .refreshable { await refresh() }
-            .task {
-                if results.isEmpty { await refresh() }
-            }
             .sheet(isPresented: $showSettings) { SettingsView() }
             .sheet(isPresented: $showShare) { ShareSheet(items: exportItems) }
             .alert(item: $alert) { payload in

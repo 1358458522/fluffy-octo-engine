@@ -10,14 +10,34 @@ enum KeychainStore {
     private static let account = "stations-master-key"
 
     /// 取出或生成 32 字节主密钥（用于加密站点配置）
+    /// 优先用钥匙串；钥匙串不可用（重签 / 无 Keychain 权限）时回落到
+    /// 沙盒内的密钥文件，避免每次启动重新生成密钥导致已导入的配置读不出来。
     static func loadOrCreateKey() -> SymmetricKey {
         if let data = read(), data.count == 32 {
+            return SymmetricKey(data: data)
+        }
+        if let data = readFallbackKey(), data.count == 32 {
+            write(data)
             return SymmetricKey(data: data)
         }
         let key = SymmetricKey(size: .bits256)
         let data = key.withUnsafeBytes { Data($0) }
         write(data)
+        writeFallbackKey(data)
         return key
+    }
+
+    private static var fallbackKeyURL: URL {
+        let dir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        return dir.appendingPathComponent(".stations.key")
+    }
+
+    private static func readFallbackKey() -> Data? {
+        try? Data(contentsOf: fallbackKeyURL)
+    }
+
+    private static func writeFallbackKey(_ data: Data) {
+        try? data.write(to: fallbackKeyURL, options: [.atomic, .completeFileProtection])
     }
 
     private static func read() -> Data? {

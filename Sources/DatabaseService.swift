@@ -15,6 +15,9 @@ enum DBError: LocalizedError {
     }
 }
 
+/// 一个站点某营业日的全天口径取数结果。
+/// 取数口径与电脑端 fetch_day 一致：营业日全部有数据的班次 + 全天合计 +
+/// 全天按油品 + 全天按支付方式，并附带用于交班判定的班次时段模板。
 struct DayAggregate {
     var count: Int = 0
     var amount: Double = 0
@@ -22,6 +25,12 @@ struct DayAggregate {
     var firstTime: String?
     var lastTime: String?
     var shifts: [ShiftRevenue] = []
+    /// 全天按油品（跨全部班次）
+    var products: [ProductStat] = []
+    /// 全天按支付方式（跨全部班次）
+    var pays: [PayStat] = []
+    /// 班次时段模板（交班判定用）
+    var template: ShiftTemplate?
 }
 
 enum DatabaseService {
@@ -56,10 +65,12 @@ enum DatabaseService {
         }
     }
 
-    // MARK: - 当日各班次营业额
+    // MARK: - 当日各班次 + 全天汇总 + 班次时段模板
 
     static func fetchDay(_ station: Station, date: String) async throws -> DayAggregate {
         try await withClient(station) { client in
+            var aggregate = DayAggregate()
+
             let sql = """
             SELECT FBusinessShiftNo AS shiftNo,
                    COUNT(*) AS cnt,
@@ -68,13 +79,12 @@ enum DatabaseService {
                    CONVERT(varchar(19), MIN(FTradeTime), 120) AS tmin,
                    CONVERT(varchar(19), MAX(FTradeTime), 120) AS tmax
             FROM TFuelTradeRecord WITH (NOLOCK)
-            WHERE CONVERT(varchar(10), FBusinessDate, 120) = '\(date)'
+            WHERE FBusinessDate = '\(date)'
             GROUP BY FBusinessShiftNo
             ORDER BY FBusinessShiftNo
             """
 
             let rows = try await client.query(sql)
-            var aggregate = DayAggregate()
 
             for row in rows {
                 let shift = row.column("shiftNo")?.int ?? 0
@@ -100,8 +110,135 @@ enum DatabaseService {
                 if aggregate.firstTime == nil { aggregate.firstTime = first }
                 if let last { aggregate.lastTime = last }
             }
+
+            // 全天按油品 / 按支付方式（与电脑端 fetch_day 同源，表结构差异时自动降级）
+            aggregate.products = await productStats(client, date: date)
+            aggregate.pays = await payStats(client, date: date)
+            // 班次时段模板（交班判定使用）
+            aggregate.template = await shiftTemplate(client, date: date)
             return aggregate
         }
+    }
+
+    // MARK: - 全天按油品
+
+    private static func productStats(_ client: SQLServerClient, date: String) async -> [ProductStat] {
+        let joinedSQL = """
+        SELECT CAST(t.FProductSN AS nvarchar(50)) AS pSn,
+               CAST(p.FProductName AS nvarchar(100)) AS pName,
+               COUNT(*) AS cnt,
+               CAST(ISNULL(SUM(t.FTradeVolume), 0) AS float) AS vol,
+               CAST(ISNULL(SUM(t.FTradeAmount), 0) AS float) AS amt
+        FROM TFuelTradeRecord t WITH (NOLOCK)
+        LEFT JOIN TProduct p WITH (NOLOCK) ON p.FProductSN = t.FProductSN
+        WHERE t.FBusinessDate = '\(date)'
+        GROUP BY t.FProductSN, p.FProductName
+        ORDER BY SUM(t.FTradeAmount) DESC
+        """
+
+        let plainSQL = """
+        SELECT CAST(FProductSN AS nvarchar(50)) AS pSn,
+               CAST('' AS nvarchar(100)) AS pName,
+               COUNT(*) AS cnt,
+               CAST(ISNULL(SUM(FTradeVolume), 0) AS float) AS vol,
+               CAST(ISNULL(SUM(FTradeAmount), 0) AS float) AS amt
+        FROM TFuelTradeRecord WITH (NOLOCK)
+        WHERE FBusinessDate = '\(date)'
+        GROUP BY FProductSN
+        ORDER BY SUM(FTradeAmount) DESC
+        """
+
+        if let rows = try? await client.query(joinedSQL) {
+            return rows.map { row in
+                ProductStat(
+                    code: row.column("pSn")?.string ?? "",
+                    name: row.column("pName")?.string ?? "",
+                    count: row.column("cnt")?.int ?? 0,
+                    volume: row.column("vol")?.double ?? 0,
+                    amount: row.column("amt")?.double ?? 0
+                )
+            }
+        }
+        if let rows = try? await client.query(plainSQL) {
+            return rows.map { row in
+                ProductStat(
+                    code: row.column("pSn")?.string ?? "",
+                    name: row.column("pName")?.string ?? "",
+                    count: row.column("cnt")?.int ?? 0,
+                    volume: row.column("vol")?.double ?? 0,
+                    amount: row.column("amt")?.double ?? 0
+                )
+            }
+        }
+        return []
+    }
+
+    // MARK: - 全天按支付方式
+
+    private static func payStats(_ client: SQLServerClient, date: String) async -> [PayStat] {
+        let sql = """
+        SELECT CAST(FPayMode AS nvarchar(50)) AS payMode,
+               COUNT(*) AS cnt,
+               CAST(ISNULL(SUM(FTradeVolume), 0) AS float) AS vol,
+               CAST(ISNULL(SUM(FTradeAmount), 0) AS float) AS amt
+        FROM TFuelTradeRecord WITH (NOLOCK)
+        WHERE FBusinessDate = '\(date)'
+        GROUP BY FPayMode
+        ORDER BY SUM(FTradeAmount) DESC
+        """
+
+        guard let rows = try? await client.query(sql) else { return [] }
+        return rows.map { row in
+            PayStat(
+                payMode: row.column("payMode")?.string ?? "",
+                count: row.column("cnt")?.int ?? 0,
+                volume: row.column("vol")?.double ?? 0,
+                amount: row.column("amt")?.double ?? 0
+            )
+        }
+    }
+
+    // MARK: - 班次时段模板（交班判定用，等价电脑端 build_shift_template）
+
+    /// 取查询日前最近一个「结构完整日」（含最多班次数）作为模板基准，
+    /// 记录该日各班次的典型开始 / 结束时间。无历史完整日时返回 nil。
+    private static func shiftTemplate(_ client: SQLServerClient, date: String) async -> ShiftTemplate? {
+        let sql = """
+        SELECT CONVERT(varchar(10), FBusinessDate, 120) AS d,
+               FBusinessShiftNo AS sh,
+               CONVERT(varchar(19), MIN(FTradeTime), 120) AS tb,
+               CONVERT(varchar(19), MAX(FTradeTime), 120) AS te
+        FROM TFuelTradeRecord WITH (NOLOCK)
+        WHERE FBusinessDate >= DATEADD(day, -6, CAST('\(date)' AS date))
+          AND FBusinessDate < CAST('\(date)' AS date)
+        GROUP BY CONVERT(varchar(10), FBusinessDate, 120), FBusinessShiftNo
+        ORDER BY d, FBusinessShiftNo
+        """
+
+        guard let rows = try? await client.query(sql) else { return nil }
+
+        var byDay: [String: [Int: ShiftTemplate.Window]] = [:]
+        for row in rows {
+            guard let day = row.column("d")?.string,
+                  let shift = row.column("sh")?.int,
+                  let begin = Fmt.parse(row.column("tb")?.string),
+                  let end = Fmt.parse(row.column("te")?.string) else { continue }
+            byDay[day, default: [:]][shift] = ShiftTemplate.Window(begin: begin, end: end)
+        }
+
+        // 取最近且班次数最多的完整日（并列时取较晚的一天，与电脑端一致）
+        var bestDay: String?
+        var bestCount = 0
+        for day in byDay.keys.sorted() {
+            let count = byDay[day]?.count ?? 0
+            if count >= max(bestCount, 1) {
+                bestDay = day
+                bestCount = count
+            }
+        }
+
+        guard let refDate = bestDay, let windows = byDay[refDate], !windows.isEmpty else { return nil }
+        return ShiftTemplate(refDate: refDate, windows: windows)
     }
 
     // MARK: - 逐笔明细
@@ -113,7 +250,7 @@ enum DatabaseService {
         limit: Int = 500
     ) async throws -> [TradeRow] {
         try await withClient(station) { client in
-            var condition = "CONVERT(varchar(10), t.FBusinessDate, 120) = '\(date)'"
+            var condition = "t.FBusinessDate = '\(date)'"
             if let shift {
                 condition += " AND t.FBusinessShiftNo = \(shift)"
             }

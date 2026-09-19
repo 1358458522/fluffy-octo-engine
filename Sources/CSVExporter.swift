@@ -19,7 +19,7 @@ enum CSVExporter {
         }
 
         lines.append("")
-        lines.append("站点,班次,营业额,销量(升),交易笔数,首笔时间,末笔时间")
+        lines.append("站点,班次,营业额,销量(升),交易笔数,首笔时间,末笔时间,交班状态")
         for r in results where !r.shifts.isEmpty {
             for s in r.shifts {
                 lines.append([
@@ -29,7 +29,37 @@ enum CSVExporter {
                     String(format: "%.2f", s.volume),
                     String(s.count),
                     csv(s.firstTime ?? ""),
-                    csv(s.lastTime ?? "")
+                    csv(s.lastTime ?? ""),
+                    csv(s.timing.rawValue)
+                ].joined(separator: ","))
+            }
+        }
+
+        lines.append("")
+        lines.append("站点,油品代码,油品名称,销量(升),营业额,交易笔数")
+        for r in results where !r.products.isEmpty {
+            for p in r.products {
+                lines.append([
+                    csv(r.stationName),
+                    csv(p.code),
+                    csv(p.name),
+                    String(format: "%.2f", p.volume),
+                    String(format: "%.2f", p.amount),
+                    String(p.count)
+                ].joined(separator: ","))
+            }
+        }
+
+        lines.append("")
+        lines.append("站点,支付方式,销量(升),营业额,交易笔数")
+        for r in results where !r.pays.isEmpty {
+            for p in r.pays {
+                lines.append([
+                    csv(r.stationName),
+                    csv(p.payMode),
+                    String(format: "%.2f", p.volume),
+                    String(format: "%.2f", p.amount),
+                    String(p.count)
                 ].joined(separator: ","))
             }
         }

@@ -1,4 +1,5 @@
 import Foundation
+import SwiftUI
 
 // MARK: - 站点配置
 
@@ -35,27 +36,91 @@ struct Station: Identifiable, Codable, Hashable {
     }
 }
 
+// MARK: - 交班状态
+
+/// 交班状态。判定算法与电脑端 `judge_shift_status` 完全一致：
+/// 1) 有班次时段模板时，把模板基准日的同班次时段整体平移到查询日：
+///    now >= 预计交班时刻（末笔交易 +3 分钟缓冲）→ 已交班
+///    已过开班时刻但未到交班时刻                 → 未交班(营业中)
+///    尚未到开班时刻                             → 未交班(未到交班点)
+/// 2) 模板缺失时兜底：末笔交易距今 > 90 分钟视为已交班。
+enum ShiftTiming: String, Codable {
+    case closed = "已交班"
+    case running = "未交班(营业中)"
+    case notYet = "未交班(未到交班点)"
+    case unknown = "未知"
+
+    var isClosed: Bool { self == .closed }
+
+    /// 电脑端配色：已交班绿字（#0b7a3b）、未交班红字（#b3261e）
+    var displayColor: Color {
+        switch self {
+        case .closed:
+            return Color(red: 0.043, green: 0.478, blue: 0.231)
+        case .running, .notYet:
+            return Color(red: 0.702, green: 0.149, blue: 0.118)
+        case .unknown:
+            return Color.secondary
+        }
+    }
+}
+
 // MARK: - 取数结果
 
-/// 单个班次的营业额
+/// 单个班次的营业额与交班状态
 struct ShiftRevenue: Identifiable, Hashable {
     var id: Int { shift }
     var shift: Int
     var count: Int
     var amount: Double
     var volume: Double
+    /// 该班次首笔交易时间（yyyy-MM-dd HH:mm:ss）
     var firstTime: String?
+    /// 该班次末笔交易时间（yyyy-MM-dd HH:mm:ss）
     var lastTime: String?
+    /// 交班状态（电脑端同口径）
+    var timing: ShiftTiming = .unknown
+
+    /// 时段文本，与电脑端 "begin ~ end" 一致
+    var period: String {
+        guard let firstTime, let lastTime, !firstTime.isEmpty, !lastTime.isEmpty else { return "" }
+        return "\(firstTime) ~ \(lastTime)"
+    }
 }
 
-/// 交班状态（本地推算）
-enum ShiftTiming: String {
-    case closed = "已交班"
-    case running = "营业中"
-    case unknown = "未知"
+/// 全天按油品
+struct ProductStat: Identifiable, Hashable {
+    var id: String { code }
+    var code: String
+    var name: String
+    var count: Int
+    var volume: Double
+    var amount: Double
 }
 
-/// 一个站点的当日结果
+/// 全天按支付方式
+struct PayStat: Identifiable, Hashable {
+    var id: String { payMode }
+    var payMode: String
+    var count: Int
+    var volume: Double
+    var amount: Double
+}
+
+/// 班次时段模板（电脑端 `build_shift_template` 的等价结构）
+struct ShiftTemplate {
+    /// 模板基准日 yyyy-MM-dd
+    var refDate: String
+    /// 班次号 -> 该班次在基准日的开始 / 结束时刻
+    var windows: [Int: Window]
+
+    struct Window {
+        var begin: Date
+        var end: Date
+    }
+}
+
+/// 一个站点的当日结果（全天口径）
 struct StationResult: Identifiable {
     let id: UUID
     var stationName: String
@@ -64,6 +129,10 @@ struct StationResult: Identifiable {
     var amount: Double
     var volume: Double
     var shifts: [ShiftRevenue]
+    /// 全天按油品
+    var products: [ProductStat] = []
+    /// 全天按支付方式
+    var pays: [PayStat] = []
     var timing: ShiftTiming
     var error: String?
     var updatedAt: Date
@@ -89,6 +158,13 @@ enum Fmt {
     static let dateFormatter: DateFormatter = {
         let f = DateFormatter()
         f.locale = Locale(identifier: "zh_CN")
+        f.dateFormat = "yyyy-MM-dd"
+        return f
+    }()
+
+    private static let dayParser: DateFormatter = {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
         f.dateFormat = "yyyy-MM-dd"
         return f
     }()
@@ -122,5 +198,11 @@ enum Fmt {
         f.locale = Locale(identifier: "en_US_POSIX")
         f.dateFormat = "yyyy-MM-dd HH:mm:ss"
         return f.date(from: text)
+    }
+
+    /// "2026-09-18" 转为当天 00:00 的 Date
+    static func parseDay(_ text: String?) -> Date? {
+        guard let text, !text.isEmpty else { return nil }
+        return dayParser.date(from: String(text.prefix(10)))
     }
 }

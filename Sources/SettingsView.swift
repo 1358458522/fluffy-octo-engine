@@ -9,6 +9,10 @@ struct SettingsView: View {
     @State private var isAdding = false
     @State private var showImport = false
     @State private var importText = ""
+    @State private var showsFileImporter = false
+    @State private var importedFileName: String?
+    @State private var importAlert: AlertPayload?
+    @State private var dismissAfterAlert = false
     @State private var showShare = false
     @State private var exportItems: [Any] = []
     @State private var alert: AlertPayload?
@@ -23,8 +27,8 @@ struct SettingsView: View {
             .listStyle(.insetGrouped)
             .navigationTitle("设置")
             .toolbar {
-                ToolbarItem(placement: .topBarLeading) { EditButton() }
-                ToolbarItem(placement: .topBarTrailing) {
+                ToolbarItem(placement: .navigationBarLeading) { EditButton() }
+                ToolbarItem(placement: .navigationBarTrailing) {
                     Button("完成") { dismiss() }
                 }
             }
@@ -125,6 +129,33 @@ struct SettingsView: View {
     private var importSheet: some View {
         NavigationStack {
             VStack(spacing: 10) {
+                HStack(spacing: 8) {
+                    Button {
+                        showsFileImporter = true
+                    } label: {
+                        Label("从文件导入", systemImage: "folder")
+                    }
+                    .buttonStyle(.borderedProminent)
+
+                    Button {
+                        importText = UIPasteboard.general.string ?? ""
+                        importedFileName = nil
+                    } label: {
+                        Label("从剪贴板粘贴", systemImage: "doc.on.clipboard")
+                    }
+                    .buttonStyle(.bordered)
+                }
+                .padding(.horizontal)
+                .padding(.top, 8)
+
+                if let importedFileName {
+                    Text("已载入文件：\(importedFileName)")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal)
+                }
+
                 TextEditor(text: $importText)
                     .font(.system(.footnote, design: .monospaced))
                     .padding(6)
@@ -133,33 +164,43 @@ struct SettingsView: View {
                             .stroke(Color.secondary.opacity(0.35))
                     )
                     .padding(.horizontal)
-                    .padding(.top, 8)
 
-                HStack {
-                    Button {
-                        importText = UIPasteboard.general.string ?? ""
-                    } label: {
-                        Label("从剪贴板粘贴", systemImage: "doc.on.clipboard")
-                    }
-                    .buttonStyle(.bordered)
-
-                    Text("同名站点会被覆盖")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-                .padding(.horizontal)
-                .padding(.bottom, 8)
+                Text("同名站点会被覆盖")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal)
+                    .padding(.bottom, 8)
             }
             .navigationTitle("批量导入")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItem(placement: .topBarLeading) {
+                ToolbarItem(placement: .navigationBarLeading) {
                     Button("取消") { showImport = false }
                 }
-                ToolbarItem(placement: .topBarTrailing) {
+                ToolbarItem(placement: .navigationBarTrailing) {
                     Button("导入") { runImport() }
                         .disabled(importText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                 }
+            }
+            .fileImporter(
+                isPresented: $showsFileImporter,
+                allowedContentTypes: [.json, .plainText, .text],
+                allowsMultipleSelection: false,
+                onCompletion: handleFileImport
+            )
+            .alert(item: $importAlert) { payload in
+                Alert(
+                    title: Text(payload.title),
+                    message: Text(payload.message),
+                    dismissButton: .default(Text("好")) {
+                        // 导入成功：确认后自动关闭导入面板；失败则留在面板里让用户改内容
+                        if dismissAfterAlert {
+                            dismissAfterAlert = false
+                            showImport = false
+                        }
+                    }
+                )
             }
         }
     }
@@ -167,14 +208,50 @@ struct SettingsView: View {
     // MARK: 逻辑
 
     private func runImport() {
+        dismissAfterAlert = false
         do {
             let count = try store.importJSON(importText)
             importText = ""
-            showImport = false
-            alert = AlertPayload(title: "导入完成", message: "已导入 \(count) 个站点。")
+            importedFileName = nil
+            dismissAfterAlert = true
+            importAlert = AlertPayload(title: "导入完成", message: "已导入 \(count) 个站点（同名站点已覆盖）。")
         } catch {
-            alert = AlertPayload(title: "导入失败", message: error.localizedDescription)
+            importAlert = AlertPayload(title: "导入失败", message: error.localizedDescription)
         }
+    }
+
+    /// 从「文件」App 选择 JSON 配置文件（iCloud 云盘 / 我的 iPhone / 微信、QQ 的“用其他应用打开”均可）
+    private func handleFileImport(_ result: Result<[URL], Error>) {
+        switch result {
+        case .success(let urls):
+            guard let url = urls.first else { return }
+            let scoped = url.startAccessingSecurityScopedResource()
+            defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+            do {
+                let data = try Data(contentsOf: url)
+                guard let text = decodeConfigText(data) else {
+                    importAlert = AlertPayload(title: "读取失败", message: "文件不是可识别的文本编码（支持 UTF-8 / UTF-16 / GB18030）。")
+                    return
+                }
+                importText = text
+                importedFileName = url.lastPathComponent
+            } catch {
+                importAlert = AlertPayload(title: "读取失败", message: error.localizedDescription)
+            }
+        case .failure(let error):
+            importAlert = AlertPayload(title: "选择文件失败", message: error.localizedDescription)
+        }
+    }
+
+    /// 依次尝试 UTF-8 / UTF-16 / GB18030
+    private func decodeConfigText(_ data: Data) -> String? {
+        if let text = String(data: data, encoding: .utf8) { return text }
+        if let text = String(data: data, encoding: .utf16) { return text }
+        let gb = CFStringConvertEncodingToNSStringEncoding(
+            CFStringEncoding(CFStringEncodings.GB_18030_2000.rawValue)
+        )
+        if let text = String(data: data, encoding: String.Encoding(rawValue: gb)) { return text }
+        return nil
     }
 
     private func exportConfig() {
@@ -256,10 +333,10 @@ struct StationEditView: View {
             .navigationTitle(isNew ? "添加站点" : "编辑站点")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItem(placement: .topBarLeading) {
+                ToolbarItem(placement: .navigationBarLeading) {
                     Button("取消") { dismiss() }
                 }
-                ToolbarItem(placement: .topBarTrailing) {
+                ToolbarItem(placement: .navigationBarTrailing) {
                     Button("保存") {
                         store.upsert(draft)
                         dismiss()

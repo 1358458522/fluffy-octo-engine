@@ -2,10 +2,15 @@ import Foundation
 
 enum RevenueService {
 
-    /// 拉取单个站点当日数据
+    /// 拉取单个站点当日数据（全天口径：各班次 + 全天合计 + 按油品 + 按支付方式 + 交班状态）
     static func refresh(_ station: Station, date: String) async -> StationResult {
         do {
             let aggregate = try await DatabaseService.fetchDay(station, date: date)
+            let shifts = statusApplied(
+                aggregate.shifts,
+                template: aggregate.template,
+                date: date
+            )
             return StationResult(
                 id: station.id,
                 stationName: station.name,
@@ -13,8 +18,10 @@ enum RevenueService {
                 count: aggregate.count,
                 amount: aggregate.amount,
                 volume: aggregate.volume,
-                shifts: aggregate.shifts,
-                timing: timing(for: aggregate),
+                shifts: shifts,
+                products: aggregate.products,
+                pays: aggregate.pays,
+                timing: stationTiming(shifts),
                 error: nil,
                 updatedAt: Date()
             )
@@ -27,6 +34,8 @@ enum RevenueService {
                 amount: 0,
                 volume: 0,
                 shifts: [],
+                products: [],
+                pays: [],
                 timing: .unknown,
                 error: friendly(error),
                 updatedAt: Date()
@@ -69,11 +78,70 @@ enum RevenueService {
         return collected.sorted { (order[$0.id] ?? 0) < (order[$1.id] ?? 0) }
     }
 
-    /// 交班状态推算：取"最后交易距今超过 90 分钟"作为已交班兜底判据
-    /// （与桌面端模板算法的兜底分支一致；后续可接入 6 日班次模板精算）
-    private static func timing(for aggregate: DayAggregate) -> ShiftTiming {
-        guard let last = Fmt.parse(aggregate.lastTime) else { return .unknown }
-        return Date().timeIntervalSince(last) > 90 * 60 ? .closed : .running
+    // MARK: - 交班状态（与电脑端 judge_shift_status 同算法）
+
+    /// 给每个班次打上交班状态
+    static func statusApplied(
+        _ shifts: [ShiftRevenue],
+        template: ShiftTemplate?,
+        date: String,
+        now: Date = Date()
+    ) -> [ShiftRevenue] {
+        shifts.map { shift in
+            var item = shift
+            item.timing = judge(shift, template: template, date: date, now: now)
+            return item
+        }
+    }
+
+    /// 单班次交班判定：
+    /// - 有模板：模板基准日同班次时段整体平移到查询日，与当前时间比较
+    /// - 无模板：末笔交易距今 > 90 分钟视为已交班（兜底，与电脑端一致）
+    static func judge(
+        _ shift: ShiftRevenue,
+        template: ShiftTemplate?,
+        date: String,
+        now: Date = Date()
+    ) -> ShiftTiming {
+        if let template,
+           let window = template.windows[shift.shift],
+           let refDay = Fmt.parseDay(template.refDate) {
+            let calendar = Calendar.current
+            let target = Fmt.parseDay(date) ?? now
+            let days = calendar.dateComponents(
+                [.day],
+                from: calendar.startOfDay(for: refDay),
+                to: calendar.startOfDay(for: target)
+            ).day ?? 0
+
+            guard let begin = calendar.date(byAdding: .day, value: days, to: window.begin),
+                  let end = calendar.date(byAdding: .day, value: days, to: window.end) else {
+                return fallbackTiming(shift.lastTime, now: now)
+            }
+
+            // 模板 end 为该班次末笔交易时间，交班动作通常在其后 1~2 分钟完成；
+            // 加 3 分钟缓冲，避免末笔交易与交班完成之间的窗口被误判为已交班（与电脑端一致）
+            if now >= end.addingTimeInterval(3 * 60) { return .closed }
+            if now >= begin { return .running }
+            return .notYet
+        }
+        return fallbackTiming(shift.lastTime, now: now)
+    }
+
+    /// 模板缺失时的兜底判定
+    private static func fallbackTiming(_ lastTime: String?, now: Date) -> ShiftTiming {
+        guard let last = Fmt.parse(lastTime) else { return .unknown }
+        return now.timeIntervalSince(last) > 90 * 60 ? .closed : .running
+    }
+
+    /// 站点级状态：全部班次已交班 → 已交班；存在营业中 → 未交班(营业中)；
+    /// 仅有未到交班点 → 未交班(未到交班点)；无班次 → 未知
+    static func stationTiming(_ shifts: [ShiftRevenue]) -> ShiftTiming {
+        guard !shifts.isEmpty else { return .unknown }
+        if shifts.allSatisfy({ $0.timing == .closed }) { return .closed }
+        if shifts.contains(where: { $0.timing == .running }) { return .running }
+        if shifts.contains(where: { $0.timing == .notYet }) { return .notYet }
+        return .unknown
     }
 
     private static func friendly(_ error: Error) -> String {

@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 struct StationDetailView: View {
     let station: Station
@@ -21,14 +22,24 @@ struct StationDetailView: View {
     var body: some View {
         List {
             headlineSection
+            totalSection
             shiftSection
+            productSection
+            paySection
             tradesSection
         }
         .listStyle(.insetGrouped)
         .navigationTitle(station.name)
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
-            ToolbarItem(placement: .topBarTrailing) {
+            ToolbarItemGroup(placement: .navigationBarTrailing) {
+                Button {
+                    copyAll()
+                } label: {
+                    Image(systemName: "doc.on.doc")
+                }
+                .disabled(result == nil)
+
                 Button {
                     Task { await loadAll() }
                 } label: {
@@ -47,29 +58,33 @@ struct StationDetailView: View {
         }
     }
 
-    // MARK: 子视图
+    // MARK: 抬头（数据源 / 营业日期 / 站点状态）
 
     private var headlineSection: some View {
         Section {
-            VStack(alignment: .leading, spacing: 10) {
-                Text(result?.error ?? "营业日期 \(date)")
-                    .font(result?.error == nil ? .footnote : .caption)
-                    .foregroundStyle(result?.error == nil ? Color.secondary : Color.red)
+            VStack(alignment: .leading, spacing: 8) {
+                if let result, let error = result.error {
+                    Label(error, systemImage: "exclamationmark.triangle.fill")
+                        .font(.footnote)
+                        .foregroundStyle(.red)
+                } else {
+                    HStack(spacing: 12) {
+                        Label("数据源 云端", systemImage: "cloud")
+                        Label("营业日期 \(date)", systemImage: "calendar")
+                    }
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
 
-                Text("¥ " + Fmt.money(result?.amount ?? 0))
-                    .font(.system(size: 32, weight: .bold, design: .rounded))
-                    .monospacedDigit()
-
-                HStack(spacing: 14) {
-                    Label("\(result?.count ?? 0) 笔", systemImage: "number")
-                    Label("\(Fmt.volume(result?.volume ?? 0)) 升", systemImage: "drop.fill")
-                    if let result, result.error == nil {
-                        Label(result.timing.rawValue, systemImage: "clock")
-                            .foregroundStyle(result.timing == .closed ? .green : .orange)
+                    if let result {
+                        Text(result.timing.rawValue)
+                            .font(.caption)
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 4)
+                            .background(result.timing.displayColor.opacity(0.12))
+                            .foregroundStyle(result.timing.displayColor)
+                            .clipShape(Capsule())
                     }
                 }
-                .font(.footnote)
-                .foregroundStyle(.secondary)
 
                 Text("云库 \(station.displayAddress) · 库 \(station.db)")
                     .font(.caption2)
@@ -79,25 +94,63 @@ struct StationDetailView: View {
         }
     }
 
+    // MARK: 全天合计
+
+    private var totalSection: some View {
+        Section("全天合计") {
+            HStack {
+                Text("营业额(元)")
+                Spacer()
+                Text(Fmt.money(result?.amount ?? 0))
+                    .monospacedDigit()
+                    .fontWeight(.semibold)
+            }
+            HStack {
+                Text("油量(升)")
+                Spacer()
+                Text(Fmt.volume(result?.volume ?? 0))
+                    .monospacedDigit()
+            }
+            HStack {
+                Text("交易笔数")
+                Spacer()
+                Text("\(result?.count ?? 0)")
+                    .monospacedDigit()
+            }
+        }
+    }
+
+    // MARK: 各班次明细（状态：已交班绿字 / 未交班红字）
+
     private var shiftSection: some View {
-        Section("班次") {
+        Section("各班次明细") {
             if let shifts = result?.shifts, !shifts.isEmpty {
                 ForEach(shifts) { shift in
-                    HStack {
-                        VStack(alignment: .leading, spacing: 3) {
-                            Text("第 \(shift.shift) 班").font(.callout)
-                            Text(timeRange(shift))
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
+                    VStack(alignment: .leading, spacing: 4) {
+                        HStack {
+                            Text("班次 \(shift.shift)")
+                            Spacer()
+                            Text("¥" + Fmt.money(shift.amount))
+                                .monospacedDigit()
                         }
-                        Spacer()
-                        VStack(alignment: .trailing, spacing: 3) {
-                            Text("¥" + Fmt.money(shift.amount)).monospacedDigit()
+
+                        HStack(spacing: 10) {
                             Text("\(shift.count) 笔 · \(Fmt.volume(shift.volume)) 升")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
+                            Spacer()
+                            Text(shift.timing.rawValue)
+                                .foregroundStyle(shift.timing.displayColor)
+                                .fontWeight(shift.timing.isClosed ? .regular : .semibold)
+                        }
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+
+                        if !shift.period.isEmpty {
+                            Text("时段 " + shift.period)
+                                .font(.caption2)
+                                .foregroundStyle(.tertiary)
                         }
                     }
+                    .padding(.vertical, 2)
                     .swipeActions {
                         Button {
                             Task { await loadTrades(shift: shift.shift) }
@@ -114,6 +167,67 @@ struct StationDetailView: View {
             }
         }
     }
+
+    // MARK: 全天按油品
+
+    private var productSection: some View {
+        Section("全天按油品") {
+            if let products = result?.products, !products.isEmpty {
+                ForEach(products) { item in
+                    HStack(spacing: 10) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(item.name.isEmpty ? item.code : item.name)
+                            Text(item.code)
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
+                        Spacer()
+                        VStack(alignment: .trailing, spacing: 2) {
+                            Text("¥" + Fmt.money(item.amount))
+                                .monospacedDigit()
+                            Text("\(Fmt.volume(item.volume)) 升 · \(item.count) 笔")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    .padding(.vertical, 2)
+                }
+            } else {
+                Text(result?.error == nil ? "当日暂无按油品汇总" : "读取失败，请下拉重试")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    // MARK: 全天按支付方式
+
+    private var paySection: some View {
+        Section("全天按支付方式") {
+            if let pays = result?.pays, !pays.isEmpty {
+                ForEach(pays) { item in
+                    HStack(spacing: 10) {
+                        Text(item.payMode.isEmpty ? "未标记" : item.payMode)
+                        Spacer()
+                        VStack(alignment: .trailing, spacing: 2) {
+                            Text("¥" + Fmt.money(item.amount))
+                                .monospacedDigit()
+                            Text("\(Fmt.volume(item.volume)) 升 · \(item.count) 笔")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    .padding(.vertical, 2)
+                }
+            } else {
+                Text(result?.error == nil ? "当日暂无按支付方式汇总" : "读取失败，请下拉重试")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    // MARK: 逐笔明细
 
     private var tradesSection: some View {
         Section("逐笔明细") {
@@ -163,12 +277,6 @@ struct StationDetailView: View {
 
     // MARK: 逻辑
 
-    private func timeRange(_ shift: ShiftRevenue) -> String {
-        let start = shift.firstTime ?? "--"
-        let end = shift.lastTime ?? "--"
-        return "\(start) → \(end)"
-    }
-
     private func loadAll() async {
         isLoading = true
         result = await RevenueService.refresh(station, date: date)
@@ -197,5 +305,12 @@ struct StationDetailView: View {
         } catch {
             alert = AlertPayload(title: "导出失败", message: error.localizedDescription)
         }
+    }
+
+    /// 复制与电脑端详情窗口一致的文本
+    private func copyAll() {
+        guard let result else { return }
+        UIPasteboard.general.string = DayReportText.make(result: result, station: station)
+        alert = AlertPayload(title: "已复制", message: "详情已复制到剪贴板，可直接粘贴到微信或备忘录。")
     }
 }

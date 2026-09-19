@@ -31,25 +31,25 @@ struct HomeView: View {
     @State private var alert: AlertPayload?
 
     private var dateText: String { Fmt.dateFormatter.string(from: date) }
-    private var totalAmount: Double { results.reduce(0) { $0 + $1.amount } }
     private var totalCount: Int { results.reduce(0) { $0 + $1.count } }
     private var failedCount: Int { results.filter { $0.error != nil }.count }
+    private var closedCount: Int { results.filter { $0.error == nil && $0.timing == .closed }.count }
 
     var body: some View {
         NavigationStack {
             List {
-                summarySection
+                dateSection
                 stationsSection
             }
             .listStyle(.insetGrouped)
             .navigationTitle("天天油报")
             .toolbar {
-                ToolbarItem(placement: .topBarLeading) {
+                ToolbarItem(placement: .navigationBarLeading) {
                     Button { showSettings = true } label: {
                         Image(systemName: "gearshape")
                     }
                 }
-                ToolbarItem(placement: .topBarTrailing) {
+                ToolbarItem(placement: .navigationBarTrailing) {
                     Button { exportSummary() } label: {
                         Image(systemName: "square.and.arrow.up")
                     }
@@ -71,11 +71,12 @@ struct HomeView: View {
 
     // MARK: 子视图
 
-    private var summarySection: some View {
+    /// 营业日期 + 汇总计数（不再展示总营业额，各站营业额在站点行内分别展示）
+    private var dateSection: some View {
         Section {
-            VStack(alignment: .leading, spacing: 10) {
+            VStack(alignment: .leading, spacing: 12) {
                 HStack {
-                    Text("总营业额").font(.subheadline).foregroundStyle(.secondary)
+                    Text("营业日期").font(.subheadline).foregroundStyle(.secondary)
                     Spacer()
                     DatePicker("", selection: $date, displayedComponents: .date)
                         .labelsHidden()
@@ -84,13 +85,12 @@ struct HomeView: View {
                         }
                 }
 
-                Text("¥ " + Fmt.money(totalAmount))
-                    .font(.system(size: 34, weight: .bold, design: .rounded))
-                    .monospacedDigit()
-
                 HStack(spacing: 14) {
                     Label("\(results.count) 站", systemImage: "building.2")
                     Label("\(totalCount) 笔", systemImage: "number")
+                    if !results.isEmpty {
+                        Label("\(closedCount) 站已交班", systemImage: "checkmark.seal")
+                    }
                     if failedCount > 0 {
                         Label("\(failedCount) 站失败", systemImage: "exclamationmark.triangle.fill")
                             .foregroundStyle(.red)
@@ -99,10 +99,19 @@ struct HomeView: View {
                 .font(.footnote)
                 .foregroundStyle(.secondary)
 
-                if let latest = results.map({ $0.updatedAt }).max() {
-                    Text("更新于 \(Fmt.time(latest))")
+                HStack(spacing: 12) {
+                    Label(ShiftTiming.closed.rawValue, systemImage: "circle.fill")
                         .font(.caption2)
-                        .foregroundStyle(.tertiary)
+                        .foregroundStyle(ShiftTiming.closed.displayColor)
+                    Label(ShiftTiming.running.rawValue, systemImage: "circle.fill")
+                        .font(.caption2)
+                        .foregroundStyle(ShiftTiming.running.displayColor)
+                    Spacer()
+                    if let latest = results.map({ $0.updatedAt }).max() {
+                        Text("更新于 \(Fmt.time(latest))")
+                            .font(.caption2)
+                            .foregroundStyle(.tertiary)
+                    }
                 }
             }
             .padding(.vertical, 4)
@@ -112,7 +121,7 @@ struct HomeView: View {
     private var stationsSection: some View {
         Section("站点") {
             if store.stations.isEmpty {
-                Text("还没有站点。点左上角齿轮 → 添加站点，或粘贴配置批量导入。")
+                Text("还没有站点。点左上角齿轮 → 添加站点，或从剪贴板/文件批量导入配置。")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
             } else {
@@ -174,7 +183,7 @@ struct HomeView: View {
     }
 }
 
-// MARK: - 站点行
+// MARK: - 站点行（逐站展示各自营业额与交班状态）
 
 struct StationRow: View {
     let station: Station
@@ -209,7 +218,7 @@ struct StationRow: View {
                 if let result, result.error == nil {
                     Text(result.timing.rawValue)
                         .font(.caption2)
-                        .foregroundStyle(indicatorColor)
+                        .foregroundStyle(result.timing.displayColor)
                 }
             }
         }
@@ -219,6 +228,6 @@ struct StationRow: View {
     private var indicatorColor: Color {
         guard let result else { return .gray }
         if result.error != nil { return .red }
-        return result.timing == .closed ? .green : .orange
+        return result.timing.displayColor
     }
 }

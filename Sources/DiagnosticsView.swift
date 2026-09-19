@@ -68,9 +68,9 @@ struct DiagnosticsView: View {
     private var probeSection: some View {
         Section {
             if store.stations.isEmpty {
-                Text("还没有站点，请先到设置里添加或导入配置。")
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
+                EmptyHint(icon: "building.2",
+                          title: "还没有站点",
+                          message: "请先到设置里添加或导入配置。")
             } else {
                 Picker("测试站点", selection: $probeStationID) {
                     ForEach(store.stations) { station in
@@ -150,9 +150,9 @@ struct DiagnosticsView: View {
                     Label("复制崩溃报告", systemImage: "doc.on.doc")
                 }
             } else {
-                Text("暂时没有崩溃记录。若刚发生过闪退，重新打开 App 后再进本页即可看到。")
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
+                EmptyHint(icon: "checkmark.seal",
+                          title: "没有崩溃记录",
+                          message: "若刚发生过闪退，重新打开 App 后再进本页即可看到。")
             }
         } header: {
             Text("上一次崩溃报告")

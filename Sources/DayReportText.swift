@@ -1,7 +1,7 @@
 import Foundation
 
-/// 站点详情纯文本（结构与电脑端「XX 详情」窗口一致），供「复制全部」使用。
-/// 段落顺序：全天合计 → 各班次明细（含时段与交班状态）→ 全天按油品 → 全天按支付方式。
+/// 站点详情纯文本，供「复制全部」使用，口径与页面一致。
+/// 段落顺序：全天合计 → 各班次明细（含时段与交班状态）→ 全天按油品（只列升数与笔数）。
 enum DayReportText {
 
     static func make(result: StationResult, station: Station) -> String {
@@ -32,26 +32,13 @@ enum DayReportText {
         if !result.products.isEmpty {
             lines.append("")
             lines.append("全天按油品")
-            lines.append("  " + pad("油品代码", 14) + pad("油品名称", 16) + pad("油量(升)", 16) + "营业额(元)")
+            lines.append("  " + pad("油品代码", 14) + pad("油品名称", 16) + pad("油量(升)", 16) + "笔数")
             for item in result.products {
                 lines.append(
                     "  " + pad(item.code, 14)
                         + pad(item.name, 16)
                         + pad(Fmt.volume(item.volume), 16)
-                        + Fmt.money(item.amount)
-                )
-            }
-        }
-
-        if !result.pays.isEmpty {
-            lines.append("")
-            lines.append("全天按支付方式")
-            lines.append("  " + pad("支付方式", 14) + pad("油量(升)", 16) + "营业额(元)")
-            for item in result.pays {
-                lines.append(
-                    "  " + pad(item.payMode, 14)
-                        + pad(Fmt.volume(item.volume), 16)
-                        + Fmt.money(item.amount)
+                        + "\(item.count)"
                 )
             }
         }

@@ -63,9 +63,9 @@ struct SettingsView: View {
     private var sitesSection: some View {
         Section {
             if store.stations.isEmpty {
-                Text("还没有站点，点底部「添加站点」，或用下方「批量导入配置」。")
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
+                EmptyHint(icon: "building.2",
+                          title: "还没有站点",
+                          message: "点底部「添加站点」，或用下方「批量导入配置」。")
             } else {
                 ForEach(store.stations) { station in
                     Button {
@@ -113,17 +113,21 @@ struct SettingsView: View {
     }
 
     private var aboutSection: some View {
-        Section("关于") {
-            HStack {
-                Text("版本")
-                Spacer()
-                Text(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.1.0")
-                    .foregroundStyle(.secondary)
-            }
+        Section {
+            InfoRow(title: "站点数量", value: "\(store.stations.count)")
+            InfoRow(title: "版本", value: appVersion)
             Text("手机流量直连各站云库取营业额，数据不经过任何第三方服务器。")
                 .font(.footnote)
                 .foregroundStyle(.secondary)
+        } header: {
+            Text("关于")
         }
+    }
+
+    private var appVersion: String {
+        let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.1.0"
+        let build = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "0"
+        return "\(version)（\(build)）"
     }
 
     private var importSheet: some View {

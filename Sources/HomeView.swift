@@ -19,25 +19,37 @@ struct ShareSheet: UIViewControllerRepresentable {
 
 // MARK: - 首页
 
+/// 取数策略（自签真机稳定版）：
+/// - 启动不自动刷新、切换营业日期不自动刷新，一切由用户手动触发；
+/// - 查询只针对勾选的站点，逐站串行执行，任何时刻最多一个云库连接；
+/// - 单站详情点进去只查该站，不做任何批量。
 struct HomeView: View {
     @EnvironmentObject private var store: ConfigStore
 
     @State private var results: [StationResult] = []
-    @State private var isRefreshing = false
+    @State private var selected: Set<UUID> = []
+    @State private var isQuerying = false
+    @State private var progressText: String?
     @State private var date = Date()
     @State private var showSettings = false
+    @State private var showDiagnostics = false
     @State private var showShare = false
     @State private var exportItems: [Any] = []
     @State private var alert: AlertPayload?
+    @State private var dateDirty = false
 
     private var dateText: String { Fmt.dateFormatter.string(from: date) }
-    private var totalCount: Int { results.reduce(0) { $0 + $1.count } }
-    private var failedCount: Int { results.filter { $0.error != nil }.count }
-    private var closedCount: Int { results.filter { $0.error == nil && $0.timing == .closed }.count }
+
+    /// 只认「当前营业日期」的结果，避免切换日期后误展示旧数据
+    private var currentResults: [StationResult] { results.filter { $0.date == dateText } }
+    private var totalCount: Int { currentResults.reduce(0) { $0 + $1.count } }
+    private var failedCount: Int { currentResults.filter { $0.error != nil }.count }
+    private var closedCount: Int { currentResults.filter { $0.error == nil && $0.timing == .closed }.count }
 
     var body: some View {
         NavigationStack {
             List {
+                if Diag.hasPreviousCrash() { crashSection }
                 dateSection
                 stationsSection
             }
@@ -49,16 +61,23 @@ struct HomeView: View {
                         Image(systemName: "gearshape")
                     }
                 }
-                ToolbarItem(placement: .navigationBarTrailing) {
+                ToolbarItemGroup(placement: .navigationBarTrailing) {
+                    Button { showDiagnostics = true } label: {
+                        Image(systemName: "stethoscope")
+                    }
                     Button { exportSummary() } label: {
                         Image(systemName: "square.and.arrow.up")
                     }
-                    .disabled(results.isEmpty)
+                    .disabled(currentResults.isEmpty)
                 }
             }
             .safeAreaInset(edge: .bottom) { bottomBar }
-            .refreshable { await refresh() }
+            .refreshable {
+                guard !selected.isEmpty else { return }
+                await querySelected()
+            }
             .sheet(isPresented: $showSettings) { SettingsView() }
+            .sheet(isPresented: $showDiagnostics) { DiagnosticsView() }
             .sheet(isPresented: $showShare) { ShareSheet(items: exportItems) }
             .alert(item: $alert) { payload in
                 Alert(title: Text(payload.title), message: Text(payload.message), dismissButton: .default(Text("好")))
@@ -68,7 +87,20 @@ struct HomeView: View {
 
     // MARK: 子视图
 
-    /// 营业日期 + 汇总计数（不再展示总营业额，各站营业额在站点行内分别展示）
+    /// 上次闪退提示（有崩溃报告时出现）
+    private var crashSection: some View {
+        Section {
+            Button {
+                showDiagnostics = true
+            } label: {
+                Label("上次运行发生过闪退，点此查看崩溃报告与运行日志", systemImage: "exclamationmark.triangle.fill")
+                    .font(.footnote)
+                    .foregroundStyle(.red)
+            }
+        }
+    }
+
+    /// 营业日期 + 汇总计数（不展示总营业额，各站营业额在站点行内分别展示）
     private var dateSection: some View {
         Section {
             VStack(alignment: .leading, spacing: 12) {
@@ -78,16 +110,14 @@ struct HomeView: View {
                     DatePicker("", selection: $date, displayedComponents: .date)
                         .labelsHidden()
                         .onChange(of: date) { _ in
-                            Task { await refresh() }
+                            // 不自动取数：改日期只标记待查询，由用户点按钮逐站查
+                            dateDirty = true
                         }
                 }
 
                 HStack(spacing: 14) {
-                    Label("\(results.count) 站", systemImage: "building.2")
+                    Label("\(currentResults.count) 站已查", systemImage: "building.2")
                     Label("\(totalCount) 笔", systemImage: "number")
-                    if !results.isEmpty {
-                        Label("\(closedCount) 站已交班", systemImage: "checkmark.seal")
-                    }
                     if failedCount > 0 {
                         Label("\(failedCount) 站失败", systemImage: "exclamationmark.triangle.fill")
                             .foregroundStyle(.red)
@@ -95,6 +125,15 @@ struct HomeView: View {
                 }
                 .font(.footnote)
                 .foregroundStyle(.secondary)
+
+                if !currentResults.isEmpty {
+                    HStack(spacing: 14) {
+                        Label("\(closedCount) 站已交班", systemImage: "checkmark.seal")
+                        Label("\(currentResults.count - closedCount) 站未交班", systemImage: "clock.badge.exclamationmark")
+                    }
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                }
 
                 HStack(spacing: 12) {
                     Label(ShiftTiming.closed.rawValue, systemImage: "circle.fill")
@@ -104,11 +143,17 @@ struct HomeView: View {
                         .font(.caption2)
                         .foregroundStyle(ShiftTiming.running.displayColor)
                     Spacer()
-                    if let latest = results.map({ $0.updatedAt }).max() {
+                    if let latest = currentResults.map({ $0.updatedAt }).max() {
                         Text("更新于 \(Fmt.time(latest))")
                             .font(.caption2)
                             .foregroundStyle(.tertiary)
                     }
+                }
+
+                if dateDirty && !selected.isEmpty {
+                    Text("已切换到 \(dateText)，点底部「查询选中站点」重新取数")
+                        .font(.caption2)
+                        .foregroundStyle(.orange)
                 }
             }
             .padding(.vertical, 4)
@@ -116,37 +161,65 @@ struct HomeView: View {
     }
 
     private var stationsSection: some View {
-        Section("站点") {
+        Section {
             if store.stations.isEmpty {
                 Text("还没有站点。点左上角齿轮 → 添加站点，或从剪贴板/文件批量导入配置。")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
             } else {
                 ForEach(store.stations) { station in
-                    NavigationLink {
-                        StationDetailView(station: station, initial: result(for: station), date: dateText)
-                    } label: {
-                        StationRow(station: station, result: result(for: station))
+                    HStack(spacing: 10) {
+                        Button {
+                            toggle(station)
+                        } label: {
+                            Image(systemName: selected.contains(station.id) ? "checkmark.circle.fill" : "circle")
+                                .font(.title3)
+                                .foregroundStyle(selected.contains(station.id) ? Color.accentColor : Color.secondary)
+                        }
+                        .buttonStyle(.plain)
+
+                        NavigationLink {
+                            StationDetailView(station: station, initial: result(for: station), date: dateText)
+                        } label: {
+                            StationRow(station: station, result: result(for: station))
+                        }
                     }
                 }
             }
+        } header: {
+            HStack {
+                Text("站点（\(selected.count) 已选）")
+                Spacer()
+                Button(allSelected ? "取消全选" : "全选") {
+                    selected = allSelected ? [] : Set(store.stations.map(\.id))
+                }
+                .font(.caption)
+                .disabled(store.stations.isEmpty)
+            }
+        } footer: {
+            Text("勾选站点后点底部按钮逐个查询（串行，一次只连一个云库）；点站点名称进入单站详情，只查该站。")
         }
     }
 
     private var bottomBar: some View {
-        HStack {
+        VStack(spacing: 6) {
+            if let progressText {
+                Text(progressText)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
             Button {
-                Task { await refresh() }
+                Task { await querySelected() }
             } label: {
                 HStack(spacing: 8) {
-                    if isRefreshing { ProgressView().tint(.white) }
-                    Text(isRefreshing ? "正在读取…" : "刷新全部站点")
+                    if isQuerying { ProgressView().tint(.white) }
+                    Text(isQuerying ? "正在查询…" : "查询选中站点（\(selected.count)）")
                 }
                 .frame(maxWidth: .infinity)
             }
             .buttonStyle(.borderedProminent)
             .controlSize(.large)
-            .disabled(isRefreshing || store.stations.isEmpty)
+            .disabled(isQuerying || selected.isEmpty)
         }
         .padding(.horizontal)
         .padding(.vertical, 8)
@@ -155,23 +228,60 @@ struct HomeView: View {
 
     // MARK: 逻辑
 
-    private func result(for station: Station) -> StationResult? {
-        results.first { $0.id == station.id }
+    private var allSelected: Bool {
+        !store.stations.isEmpty && selected.count == store.stations.count
     }
 
-    private func refresh() async {
-        guard !store.stations.isEmpty else { return }
-        isRefreshing = true
-        let snapshot = store.stations
+    private func toggle(_ station: Station) {
+        if selected.contains(station.id) {
+            selected.remove(station.id)
+        } else {
+            selected.insert(station.id)
+        }
+    }
+
+    private func result(for station: Station) -> StationResult? {
+        results.first { $0.id == station.id && $0.date == dateText }
+    }
+
+    /// 逐站串行查询勾选的站点
+    private func querySelected() async {
+        guard !isQuerying else { return }
+        let targets = store.stations.filter { selected.contains($0.id) }
+        guard !targets.isEmpty else {
+            alert = AlertPayload(title: "先勾选站点", message: "在站点列表左侧勾选一个或多个站点，再点查询。")
+            return
+        }
+
+        isQuerying = true
         let day = dateText
-        let fresh = await RevenueService.refreshAll(snapshot, date: day)
-        results = fresh
-        isRefreshing = false
+        Diag.log("【首页】开始查询 \(targets.count) 站（串行）")
+
+        let fresh = await RevenueService.refreshSerial(targets, date: day) { done, total, name in
+            progressText = "正在查询 \(done + 1)/\(total)：\(name)"
+        }
+
+        merge(fresh)
+        progressText = nil
+        isQuerying = false
+        dateDirty = false
+    }
+
+    private func merge(_ fresh: [StationResult]) {
+        let order = Dictionary(uniqueKeysWithValues: store.stations.enumerated().map { ($1.id, $0) })
+        for item in fresh {
+            if let idx = results.firstIndex(where: { $0.id == item.id }) {
+                results[idx] = item
+            } else {
+                results.append(item)
+            }
+        }
+        results.sort { (order[$0.id] ?? 0) < (order[$1.id] ?? 0) }
     }
 
     private func exportSummary() {
         do {
-            let url = try CSVExporter.writeSummary(results, date: dateText)
+            let url = try CSVExporter.writeSummary(currentResults, date: dateText)
             exportItems = [url]
             showShare = true
         } catch {
@@ -199,8 +309,12 @@ struct StationRow: View {
                         .font(.caption)
                         .foregroundStyle(.red)
                         .lineLimit(2)
+                } else if let result {
+                    Text("\(result.count) 笔 · \(Fmt.volume(result.volume)) 升")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                 } else {
-                    Text("\(result?.count ?? 0) 笔 · \(Fmt.volume(result?.volume ?? 0)) 升")
+                    Text("未查询")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -209,7 +323,7 @@ struct StationRow: View {
             Spacer()
 
             VStack(alignment: .trailing, spacing: 3) {
-                Text("¥" + Fmt.money(result?.amount ?? 0))
+                Text(result == nil ? "--" : "¥" + Fmt.money(result?.amount ?? 0))
                     .font(.callout)
                     .monospacedDigit()
                 if let result, result.error == nil {

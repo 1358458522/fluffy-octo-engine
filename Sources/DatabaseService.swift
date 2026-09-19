@@ -1,10 +1,11 @@
 import Foundation
 import SQLServerKit
 
-/// 关键改点提示：
-/// 若 CI 编译报错并指向下面 Configuration 初始化里的 `tlsConfiguration:`，
-/// 说明该参数不是可选类型，把 `station.useTLS ? .makeClientConfiguration() : nil`
-/// 改为恒定的 `.makeClientConfiguration()` 即可，其余代码不受影响。
+/// 取数链路约定（自签真机稳定版）：
+/// 1) 只允许「单站串行」查询 —— 上层不并发，任何批量都由上层逐个 await；
+/// 2) 站点连接在本次运行内复用，不再每次查询新建/拆除线程池；
+/// 3) TLS 统一信任服务端证书（云库为自签证书），严格校验会握手失败；
+/// 4) 每一步都写 Diag 日志，真机崩溃后可回看崩溃报告里的最后阶段。
 enum DBError: LocalizedError {
     case emptyServer
 
@@ -35,7 +36,67 @@ struct DayAggregate {
 
 enum DatabaseService {
 
-    // MARK: - 建连
+    // MARK: - 建连（单站串行 + 连接复用 + 全程留痕）
+
+    /// 站点连接缓存：同一站点在一次运行内复用长连接，避免每次查询都新建/拆除线程池。
+    /// 新方案只做串行查询（一次最多一个站点），缓存上限 3 个，超出按最久未用淘汰。
+    private static let cacheLock = NSLock()
+    private static var clients: [String: SQLServerClient] = [:]
+    private static var clientOrder: [String] = []
+    private static let clientLimit = 3
+
+    private static func clientKey(_ station: Station) -> String {
+        let hp = station.hostPort
+        return "\(hp.host):\(hp.port)/\(station.db)/\(station.user)/\(station.useTLS ? "tls" : "plain")"
+    }
+
+    /// 站点连接配置。
+    /// 站点云库用的是自签证书，必须信任服务端证书（等价 SSMS / JDBC 的 trustServerCertificate=true），
+    /// 严格校验证书会导致握手失败；同时关闭 TNIR，避免数值 IP 场景下多余的名字解析。
+    private static func configuration(for station: Station, host: String) -> SQLServerClient.Configuration {
+        SQLServerClient.Configuration(
+            hostname: host,
+            port: station.hostPort.port,
+            database: station.db.isEmpty ? "moms" : station.db,
+            authentication: .sqlPassword(username: station.user, password: station.pwd),
+            tlsEnabled: station.useTLS,
+            trustServerCertificate: true,
+            encryptionMode: .optional,
+            transparentNetworkIPResolution: false
+        )
+    }
+
+    private static func cachedClient(_ key: String) -> SQLServerClient? {
+        cacheLock.lock(); defer { cacheLock.unlock() }
+        return clients[key]
+    }
+
+    private static func store(key: String, client: SQLServerClient) {
+        cacheLock.lock()
+        clients[key] = client
+        clientOrder.removeAll { $0 == key }
+        clientOrder.append(key)
+        var evicted: [SQLServerClient] = []
+        while clientOrder.count > clientLimit {
+            let oldest = clientOrder.removeFirst()
+            if let dead = clients.removeValue(forKey: oldest) { evicted.append(dead) }
+        }
+        cacheLock.unlock()
+        // 淘汰的连接放到后台关闭，不阻塞当前查询
+        for dead in evicted {
+            Task.detached { try? await dead.shutdownGracefully() }
+        }
+    }
+
+    private static func dropClient(_ key: String) {
+        cacheLock.lock()
+        let dead = clients.removeValue(forKey: key)
+        clientOrder.removeAll { $0 == key }
+        cacheLock.unlock()
+        if let dead {
+            Task.detached { try? await dead.shutdownGracefully() }
+        }
+    }
 
     private static func withClient<T>(
         _ station: Station,
@@ -43,25 +104,82 @@ enum DatabaseService {
     ) async throws -> T {
         let host = station.hostPort.host
         guard !host.isEmpty else { throw DBError.emptyServer }
+        let key = clientKey(station)
 
+        if let cached = cachedClient(key) {
+            Diag.log("复用连接 \(key)")
+            do {
+                return try await body(cached)
+            } catch {
+                Diag.log("查询失败，丢弃该站连接：\(error)")
+                dropClient(key)
+                throw error
+            }
+        }
+
+        Diag.log("新建连接 \(key)（TLS \(station.useTLS ? "开" : "关")）")
+        let client: SQLServerClient
+        do {
+            client = try await SQLServerClient.connect(configuration: configuration(for: station, host: host))
+        } catch {
+            Diag.log("建连失败 \(key)：\(error)")
+            throw error
+        }
+        Diag.log("建连成功 \(key)")
+        store(key: key, client: client)
+
+        do {
+            return try await body(client)
+        } catch {
+            Diag.log("查询失败，丢弃该站连接：\(error)")
+            dropClient(key)
+            throw error
+        }
+    }
+
+    // MARK: - 诊断探针（「诊断」页使用：一次只测一项）
+
+    enum ProbeMode: String, CaseIterable {
+        case plain = "不加密（TLS 关）"
+        case trust = "加密 + 信任服务端证书"
+        case strict = "加密 + 严格校验证书"
+    }
+
+    /// 单站点连通性探针：建连 + SELECT @@VERSION，返回可直接展示的结论
+    static func probe(_ station: Station, mode: ProbeMode) async -> String {
+        let host = station.hostPort.host
+        guard !host.isEmpty else { return "❌ 该站点未配置云库地址" }
+
+        let tls: SQLServerTLSConfiguration?
+        switch mode {
+        case .plain: tls = nil
+        case .trust: tls = .trustingServerCertificate
+        case .strict: tls = .clientDefault
+        }
+
+        Diag.log("探针开始：\(station.name) / \(mode.rawValue)")
         let configuration = SQLServerClient.Configuration(
             hostname: host,
             port: station.hostPort.port,
-            login: .init(
-                database: station.db.isEmpty ? "moms" : station.db,
-                authentication: .sqlPassword(username: station.user, password: station.pwd)
-            ),
-            tlsConfiguration: station.useTLS ? .makeClientConfiguration() : nil
+            database: station.db.isEmpty ? "moms" : station.db,
+            authentication: .sqlPassword(username: station.user, password: station.pwd),
+            tlsConfiguration: tls,
+            encryptionMode: .optional,
+            transparentNetworkIPResolution: false
         )
 
-        let client = try await SQLServerClient.connect(configuration: configuration)
         do {
-            let value = try await body(client)
+            let client = try await SQLServerClient.connect(configuration: configuration)
+            Diag.log("探针建连成功，执行 SELECT @@VERSION")
+            let rows = try await client.query("SELECT @@VERSION AS v")
+            let version = (rows.first?.column("v")?.string ?? "")
+                .replacingOccurrences(of: "\n", with: " ")
             try? await client.shutdownGracefully()
-            return value
+            Diag.log("探针成功：\(mode.rawValue)")
+            return "✅ \(mode.rawValue)：连通\n第 \(version.prefix(100))"
         } catch {
-            try? await client.shutdownGracefully()
-            throw error
+            Diag.log("探针失败：\(mode.rawValue)：\(error)")
+            return "❌ \(mode.rawValue)：失败\n\(error)"
         }
     }
 
@@ -84,7 +202,9 @@ enum DatabaseService {
             ORDER BY FBusinessShiftNo
             """
 
+            Diag.log("查询: 班次汇总 \(date)")
             let rows = try await client.query(sql)
+            Diag.log("查询: 班次汇总返回 \(rows.count) 行")
 
             for row in rows {
                 let shift = row.column("shiftNo")?.int ?? 0
@@ -112,10 +232,14 @@ enum DatabaseService {
             }
 
             // 全天按油品 / 按支付方式（与电脑端 fetch_day 同源，表结构差异时自动降级）
+            Diag.log("查询: 按油品汇总")
             aggregate.products = await productStats(client, date: date)
+            Diag.log("查询: 按支付方式汇总")
             aggregate.pays = await payStats(client, date: date)
             // 班次时段模板（交班判定使用）
+            Diag.log("查询: 班次时段模板")
             aggregate.template = await shiftTemplate(client, date: date)
+            Diag.log("查询: 当日取数完成")
             return aggregate
         }
     }
@@ -273,7 +397,9 @@ enum DatabaseService {
             ORDER BY t.FTradeTime DESC
             """
 
+            Diag.log("查询: 逐笔明细 \(date) 班次\(shift.map(String.init) ?? "全部")")
             let rows = try await client.query(sql)
+            Diag.log("查询: 逐笔明细返回 \(rows.count) 行")
             return rows.map { row in
                 let paid = row.column("paid")?.int ?? 0
                 let makeout = row.column("makeout")?.int ?? 0

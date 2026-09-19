@@ -21,6 +21,7 @@ struct StationDetailView: View {
 
     var body: some View {
         List {
+            querySection
             headlineSection
             totalSection
             shiftSection
@@ -49,12 +50,33 @@ struct StationDetailView: View {
             }
         }
         .refreshable { await loadAll() }
-        .task {
-            if result == nil { await loadAll() }
-        }
+        // 注意：进入本页不自动取数。云库连接必须由用户手动触发（点下方「查询本站」或右上刷新），
+        // 避免"点开站点即连库"在自签真机上触发闪退。
         .sheet(isPresented: $showShare) { ShareSheet(items: exportItems) }
         .alert(item: $alert) { payload in
             Alert(title: Text(payload.title), message: Text(payload.message), dismissButton: .default(Text("好")))
+        }
+    }
+
+    // MARK: 手动取数入口（进页面不自动连库）
+
+    private var querySection: some View {
+        Section {
+            Button {
+                Task { await loadAll() }
+            } label: {
+                HStack {
+                    Label(result == nil ? "查询本站当日数据（\(date)）" : "重新查询本站当日数据（\(date)）",
+                          systemImage: "arrow.down.circle")
+                    Spacer()
+                    if isLoading { ProgressView() }
+                }
+            }
+            .disabled(isLoading)
+
+            Text("只连本站这一个云库，串行执行，不并发、不影响其它站点。")
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
         }
     }
 
@@ -278,7 +300,9 @@ struct StationDetailView: View {
     // MARK: 逻辑
 
     private func loadAll() async {
+        guard !isLoading else { return }
         isLoading = true
+        Diag.log("【详情】开始查询 \(station.name) \(date)")
         result = await RevenueService.refresh(station, date: date)
         isLoading = false
     }

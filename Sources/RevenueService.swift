@@ -4,8 +4,10 @@ enum RevenueService {
 
     /// 拉取单个站点当日数据（全天口径：各班次 + 全天合计 + 按油品 + 按支付方式 + 交班状态）
     static func refresh(_ station: Station, date: String) async -> StationResult {
+        Diag.log("【取数】开始 \(station.name) \(date)")
         do {
             let aggregate = try await DatabaseService.fetchDay(station, date: date)
+            Diag.log("【取数】成功 \(station.name)：\(aggregate.count) 笔")
             let shifts = statusApplied(
                 aggregate.shifts,
                 template: aggregate.template,
@@ -26,6 +28,7 @@ enum RevenueService {
                 updatedAt: Date()
             )
         } catch {
+            Diag.log("【取数】失败 \(station.name)：\(error)")
             return StationResult(
                 id: station.id,
                 stationName: station.name,
@@ -43,39 +46,26 @@ enum RevenueService {
         }
     }
 
-    /// 并发拉取全部站点（默认最多 6 路并发，避免站点侧压力）
-    static func refreshAll(
+    /// 逐站串行拉取（当前唯一允许的批量方式）：一次只查一个站点，查完再查下一个。
+    /// 与电脑端一致，不再对云库发起任何并发连接。
+    /// - Parameter onProgress: 每站开始前回调 (已完成数, 总数, 站点名)
+    static func refreshSerial(
         _ stations: [Station],
         date: String,
-        maxConcurrent: Int = 6
+        onProgress: @MainActor (Int, Int, String) -> Void = { _, _, _ in }
     ) async -> [StationResult] {
         guard !stations.isEmpty else { return [] }
-
-        let order = Dictionary(uniqueKeysWithValues: stations.enumerated().map { ($1.id, $0) })
+        Diag.log("【串行取数】开始，共 \(stations.count) 站")
         var collected: [StationResult] = []
         collected.reserveCapacity(stations.count)
 
-        await withTaskGroup(of: StationResult.self) { group in
-            var next = 0
-            let total = stations.count
-
-            while next < min(maxConcurrent, total) {
-                let station = stations[next]
-                group.addTask { await refresh(station, date: date) }
-                next += 1
-            }
-
-            for await result in group {
-                collected.append(result)
-                if next < total {
-                    let station = stations[next]
-                    group.addTask { await refresh(station, date: date) }
-                    next += 1
-                }
-            }
+        for (index, station) in stations.enumerated() {
+            await onProgress(index, stations.count, station.name)
+            collected.append(await refresh(station, date: date))
         }
 
-        return collected.sorted { (order[$0.id] ?? 0) < (order[$1.id] ?? 0) }
+        Diag.log("【串行取数】完成，共 \(collected.count) 站")
+        return collected
     }
 
     // MARK: - 交班状态（与电脑端 judge_shift_status 同算法）

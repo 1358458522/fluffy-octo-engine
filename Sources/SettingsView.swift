@@ -301,12 +301,16 @@ struct StationEditView: View {
                         .textInputAutocapitalization(.never)
                 }
 
-                Section("云库账号") {
+                Section {
                     TextField("账号", text: $draft.user)
                         .autocorrectionDisabled()
                         .textInputAutocapitalization(.never)
                     SecureField("密码", text: $draft.pwd)
                     Toggle("强制加密连接（TLS）", isOn: $draft.useTLS)
+                } header: {
+                    Text("云库账号")
+                } footer: {
+                    Text("云库不要求加密，请保持「关闭」。iOS 真机上加密连接会触发底层崩溃导致闪退（已实测），请勿打开。")
                 }
 
                 Section {

@@ -19,3 +19,4 @@ __pycache__/
 config.pkg
 mobile_config.json
 *.ipa
+dist/

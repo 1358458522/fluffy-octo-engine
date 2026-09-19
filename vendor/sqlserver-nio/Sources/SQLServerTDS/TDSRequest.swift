@@ -427,8 +427,19 @@ final class TDSRequestHandler: ChannelDuplexHandler, @unchecked Sendable {
             throw TDSError.protocolError("Encryption was requested but a TLS Configuration was not provided.")
         }
         
-        let sslContext = try! NIOSSLContext(configuration: tlsConfig)
-        let sslHandler = try! NIOSSLClientHandler(context: sslContext, serverHostname: serverHostname)
+        // iOS 真机修复：这里原本是两个 try!。当 NIOSSLContext / NIOSSLClientHandler
+        // 创建失败（自签证书、老版本 SQL Server 等场景）时，try! 会以 Swift 陷阱（SIGTRAP）
+        // 直接终止进程，Swift 层 catch 不到，表现为 App 无提示闪退。
+        // 改为抛出错误，由调用方（_channelRead → errorCaught）走正常失败路径。
+        let sslContext: NIOSSLContext
+        let sslHandler: NIOSSLClientHandler
+        do {
+            sslContext = try NIOSSLContext(configuration: tlsConfig)
+            sslHandler = try NIOSSLClientHandler(context: sslContext, serverHostname: serverHostname)
+        } catch {
+            logger.error("TLS 初始化失败（已捕获，不再崩溃）：\(error)")
+            throw error
+        }
         self.sslClientHandler = sslHandler
         
         let coordinator = PipelineOrganizationHandler(logger: logger, firstDecoder, firstEncoder, sslHandler)

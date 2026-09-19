@@ -92,8 +92,23 @@ final class ConfigStore: ObservableObject {
             let box = try AES.GCM.SealedBox(combined: data)
             let plain = try AES.GCM.open(box, using: key)
             stations = try JSONDecoder().decode([Station].self, from: plain)
+            migrateTLSIfNeeded()
         } catch {
             lastError = "本地配置解密失败：\(error.localizedDescription)"
+        }
+    }
+
+    /// v0.1.1 迁移：把历史站点里打开的「强制加密连接（TLS）」统一关掉。
+    /// 原因：iOS 真机上 TLS 分支会触发 sqlserver-nio 底层陷阱直接闪退（Swift 层无法 catch），
+    /// 而云库本身不要求加密（PRELOGIN 实测 22 站均返回「不支持加密」），明文连接可正常取数。
+    private func migrateTLSIfNeeded() {
+        guard !UserDefaults.standard.bool(forKey: "tls_migration_v2_done") else { return }
+        let count = stations.filter { $0.useTLS }.count
+        for i in stations.indices { stations[i].useTLS = false }
+        UserDefaults.standard.set(true, forKey: "tls_migration_v2_done")
+        if count > 0 {
+            save()
+            Diag.log("迁移：已把 \(count) 个站点的加密连接关闭（iOS 上加密连接会闪退）")
         }
     }
 
@@ -169,6 +184,8 @@ final class ConfigStore: ObservableObject {
             item.id = UUID()
             if item.db.isEmpty { item.db = "moms" }
             if item.user.isEmpty { item.user = "sa" }
+            // iOS 上加密连接会闪退，导入时统一按不加密落库（云库本身不要求加密）
+            item.useTLS = false
             if overwriteByName, let idx = stations.firstIndex(where: { $0.name == item.name }) {
                 item.id = stations[idx].id
                 stations[idx] = item

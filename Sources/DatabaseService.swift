@@ -118,12 +118,26 @@ enum DatabaseService {
         }
 
         Diag.log("新建连接 \(key)（TLS \(station.useTLS ? "开" : "关")）")
-        let client: SQLServerClient
+        var client: SQLServerClient
         do {
             client = try await SQLServerClient.connect(configuration: configuration(for: station, host: host))
         } catch {
-            Diag.log("建连失败 \(key)：\(error)")
-            throw error
+            // 兜底：若该站误开了加密连接而建连失败，自动降级为不加密再试一次
+            //（iOS 上加密连接不可用，云库本身不要求加密）
+            guard station.useTLS else {
+                Diag.log("建连失败 \(key)：\(error)")
+                throw error
+            }
+            Diag.log("加密建连失败，自动降级为不加密重试：\(error)")
+            var plain = station
+            plain.useTLS = false
+            do {
+                client = try await SQLServerClient.connect(configuration: configuration(for: plain, host: host))
+                Diag.log("降级不加密后建连成功 \(key)")
+            } catch {
+                Diag.log("建连失败 \(key)：\(error)")
+                throw error
+            }
         }
         Diag.log("建连成功 \(key)")
         store(key: key, client: client)
@@ -143,6 +157,14 @@ enum DatabaseService {
         case plain = "不加密（TLS 关）"
         case trust = "加密 + 信任服务端证书"
         case strict = "加密 + 严格校验证书"
+
+        /// 诊断页展示用标题：TLS 两项在 iOS 真机上可能闪退，明确标注提醒
+        var title: String {
+            switch self {
+            case .plain: return rawValue
+            case .trust, .strict: return rawValue + "（iOS 上会闪退，仅作对比）"
+            }
+        }
     }
 
     /// 单站点连通性探针：建连 + SELECT @@VERSION，返回可直接展示的结论

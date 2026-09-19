@@ -83,7 +83,7 @@ struct DiagnosticsView: View {
                         run(mode)
                     } label: {
                         HStack {
-                            Text(mode.rawValue)
+                            Text(mode.title)
                                 .foregroundStyle(.primary)
                             Spacer()
                             if runningMode == mode { ProgressView() }

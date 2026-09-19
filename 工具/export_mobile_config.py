@@ -27,7 +27,7 @@
       "count": 19,
       "stations": [
         {"id": "8F3B…（自动生成，iOS 端必填）", "name": "站点名", "server": "云库IP,端口",
-         "db": "moms", "user": "云库账号", "pwd": "云库密码", "useTLS": true},
+         "db": "moms", "user": "云库账号", "pwd": "云库密码", "useTLS": false},
         ...
       ]
     }
@@ -41,7 +41,8 @@
     db       数据库名，默认 "moms"
     user     SQL 账号（非 Windows 集成认证；配置中缺省时按主软件口径回填 "sa"）
     pwd      SQL 密码（配置中缺失时原样输出空串，并在终端给出提示）
-    useTLS   是否启用 TLS（默认 true；云库为公网独立实例，建议保持开启）
+    useTLS   是否启用 TLS（默认 false；iOS 端加密连接会闪退，云库本身不要求加密；
+             确需加密时可加 --tls，但不推荐）
 
 用法示例
     python export_mobile_config.py                        # 自动找配置，交互式输入口令
@@ -51,6 +52,7 @@
     python export_mobile_config.py --data-dir "D:\\天天油报" --pwd-env TTYB_PWD
     python export_mobile_config.py --data-dir "D:\\天天油报" --flat-array
     python export_mobile_config.py --dry-run              # 只统计不写文件
+    python export_mobile_config.py --tls                  # 导出 useTLS=true（iOS 端会闪退，勿用）
 
 安全约定
     · 本脚本不打印任何明文账号 / 密码；终端只输出站点数量、站名与脱敏地址。
@@ -265,7 +267,9 @@ def main(argv=None):
     ap.add_argument("--pwd", default="", help="配置包解锁口令（不推荐：会留在命令行历史）")
     ap.add_argument("--pwd-env", default="", help="从该环境变量读取解锁口令（推荐）")
     ap.add_argument("--flat-array", action="store_true", help="输出裸数组（不含外层元信息）")
-    ap.add_argument("--no-tls", action="store_true", help="useTLS 全部置为 false（默认 true）")
+    ap.add_argument("--tls", action="store_true",
+                    help="useTLS 置为 true（不推荐：iOS 端加密连接会闪退）")
+    ap.add_argument("--no-tls", action="store_true", help=argparse.SUPPRESS)  # 历史参数，默认即不加密
     ap.add_argument("--dry-run", action="store_true", help="只解析统计，不写文件")
     ap.add_argument("--quiet", action="store_true", help="不打印站点明细（仍打印结果行）")
     args = ap.parse_args(argv)
@@ -301,9 +305,10 @@ def main(argv=None):
                   % (r["name"], mask_hostport(r["server"]), r["db"],
                      mask_user(r["user"]), str(r["useTLS"]).lower()))
 
-    if args.no_tls:
-        for r in rows:
-            r["useTLS"] = False
+    # iOS 端加密连接会触发底层陷阱直接闪退（真机实测 SIGTRAP），而云库本身不要求加密
+    # （PRELOGIN 实测 22 站均返回「不支持加密」）：因此默认按不加密导出。
+    for r in rows:
+        r["useTLS"] = bool(args.tls)
 
     if args.dry_run:
         print("[3/3] --dry-run：未写出文件")

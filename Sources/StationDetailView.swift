@@ -129,7 +129,7 @@ struct StationDetailView: View {
     // MARK: - 站点信息
 
     private var overviewSection: some View {
-        Section("站点") {
+        Section("状态") {
             HStack {
                 Text("交班状态")
                 Spacer()
@@ -140,10 +140,6 @@ struct StationDetailView: View {
                         .foregroundStyle(.tertiary)
                 }
             }
-
-            InfoRow(title: "云库", value: station.displayAddress)
-            InfoRow(title: "数据库", value: station.db)
-            InfoRow(title: "账号", value: station.user)
 
             if let result {
                 InfoRow(title: "取数时间", value: Fmt.time(result.updatedAt))
@@ -246,23 +242,16 @@ struct StationDetailView: View {
             if let products = result?.products, !products.isEmpty {
                 ForEach(products) { item in
                     HStack(spacing: 12) {
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text(item.name.isEmpty ? item.code : item.name)
-                            Text(item.code)
-                                .font(.caption2)
-                                .foregroundStyle(.tertiary)
-                        }
-                        Spacer()
-                        VStack(alignment: .trailing, spacing: 2) {
-                            Text("\(Fmt.volume(item.volume)) 升")
-                                .monospacedDigit()
-                                .fontWeight(.medium)
-                            Text("\(item.count) 笔")
-                                .font(.caption2)
-                                .foregroundStyle(.secondary)
-                        }
+                        Text(item.name.isEmpty ? item.code : item.name)
+                            .lineLimit(1)
+
+                        Spacer(minLength: 8)
+
+                        Text("\(Fmt.volume(item.volume)) 升")
+                            .monospacedDigit()
+                            .fontWeight(.medium)
                     }
-                    .padding(.vertical, 2)
+                    .padding(.vertical, 3)
                 }
             } else {
                 Text(placeholder("当日暂无按油品汇总"))
@@ -272,7 +261,7 @@ struct StationDetailView: View {
         } header: {
             Text("全天按油品")
         } footer: {
-            Text("按油品只统计升数与笔数。")
+            Text("按油品只统计升数。")
         }
     }
 

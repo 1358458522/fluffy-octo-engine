@@ -127,10 +127,21 @@ final class ConfigStore: ObservableObject {
         var incoming: [Station] = []
         if let list = try? decoder.decode([Station].self, from: data) {
             incoming = list
-        } else if let wrapper = try? decoder.decode(StationWrapper.self, from: data) {
-            incoming = wrapper.stations
         } else {
-            throw ImportError.badFormat
+            do {
+                incoming = try decoder.decode(StationWrapper.self, from: data).stations
+            } catch {
+                throw ImportError.badFormat(error.localizedDescription)
+            }
+        }
+
+        // 丢弃缺站名 / 缺云库地址的空条目，避免脏数据落库
+        incoming = incoming.filter {
+            !$0.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                && !$0.server.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
+        guard !incoming.isEmpty else {
+            throw ImportError.badFormat("文件中没有含 name / server 的站点条目")
         }
 
         var imported = 0
@@ -163,12 +174,15 @@ final class ConfigStore: ObservableObject {
 
     enum ImportError: LocalizedError {
         case badText
-        case badFormat
+        case badFormat(String)
 
         var errorDescription: String? {
             switch self {
-            case .badText: return "内容不是有效的文本"
-            case .badFormat: return "不是可识别的配置格式（需为 JSON 数组或含 stations 字段的对象）"
+            case .badText:
+                return "内容不是有效的文本"
+            case .badFormat(let detail):
+                let head = "不是可识别的配置格式（需为 JSON 数组或含 stations 字段的对象）"
+                return detail.isEmpty ? head : "\(head)\n原因：\(detail)"
             }
         }
     }

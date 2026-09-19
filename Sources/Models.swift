@@ -15,6 +15,38 @@ struct Station: Identifiable, Codable, Hashable {
     /// 云库若要求强制加密连接，打开此项
     var useTLS: Bool = false
 
+    init(id: UUID = UUID(), name: String = "", server: String = "",
+         db: String = "moms", user: String = "sa", pwd: String = "", useTLS: Bool = false) {
+        self.id = id
+        self.name = name
+        self.server = server
+        self.db = db
+        self.user = user
+        self.pwd = pwd
+        self.useTLS = useTLS
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id, name, server, db, user, pwd, useTLS
+    }
+
+    /// 宽松解码：兼容外部工具（export_mobile_config.py 等）导出的 JSON——
+    /// 缺 id 时自动生成、缺 db/user 时回填默认值，不因可选字段缺失而整体失败。
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = (try? c.decode(UUID.self, forKey: .id)) ?? UUID()
+        name = (try? c.decode(String.self, forKey: .name)) ?? ""
+        server = (try? c.decode(String.self, forKey: .server)) ?? ""
+        let dbText = ((try? c.decode(String.self, forKey: .db)) ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        db = dbText.isEmpty ? "moms" : dbText
+        let userText = ((try? c.decode(String.self, forKey: .user)) ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        user = userText.isEmpty ? "sa" : userText
+        pwd = (try? c.decode(String.self, forKey: .pwd)) ?? ""
+        useTLS = (try? c.decode(Bool.self, forKey: .useTLS)) ?? false
+    }
+
     /// 解析出的 (host, port)
     var hostPort: (host: String, port: Int) {
         let raw = server

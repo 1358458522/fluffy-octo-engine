@@ -26,14 +26,15 @@
       "exported_at": "2026-09-18T10:00:00",
       "count": 19,
       "stations": [
-        {"name": "站点名", "server": "云库IP,端口", "db": "moms",
-         "user": "云库账号", "pwd": "云库密码", "useTLS": true},
+        {"id": "8F3B…（自动生成，iOS 端必填）", "name": "站点名", "server": "云库IP,端口",
+         "db": "moms", "user": "云库账号", "pwd": "云库密码", "useTLS": true},
         ...
       ]
     }
-    --flat-array 时输出裸数组 [ {...}, {...} ]（仅 6 个字段，不含外层元信息）
+    --flat-array 时输出裸数组 [ {...}, {...} ]（仍含 id 字段，不含外层元信息）
 
 字段说明
+    id       站点 UUID（每次导出随机生成，iOS 端解码必需；缺失会导致导入失败）
     name     站点名（主软件站点列表中的名称）
     server   云库地址，主软件原始写法 "<主机>,<端口>"（兼容 "<主机>:<端口>"）；
              移动端请按「最后一个 , 或 :」切分主机与端口，缺端口时默认 1433
@@ -68,6 +69,7 @@ import json
 import os
 import re
 import sys
+import uuid
 
 # ---------------------------------------------------------------- 常量（与主软件保持一致）
 KDF_ITERS_DEFAULT = 200000          # 主软件 _KDF_ITERS
@@ -244,7 +246,8 @@ def collect_stations(cfg):
         if not SERVER_RE.match(server):
             skipped.append((name, "云库地址格式异常（非 <主机>,<端口>）"))
             continue
-        out.append({"name": name, "server": server, "db": db,
+        out.append({"id": str(uuid.uuid4()).upper(),
+                    "name": name, "server": server, "db": db,
                     "user": user, "pwd": pwd, "useTLS": True})
         if not pwd:
             notes.append((name, "云库密码为空，手机端可能连不上；建议先在主软件中对本站执行一次抓取以缓存凭据"))

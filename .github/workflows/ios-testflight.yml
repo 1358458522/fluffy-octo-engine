@@ -1,0 +1,195 @@
+name: Build & Upload to TestFlight
+
+# ============================================================================
+# 天天油报 iOS 正式签名 + TestFlight 上传链路
+#
+# 所需 Actions Secrets（仓库 Settings → Secrets and variables → Actions）：
+#   APP_TEAM_ID    Apple Developer Team ID（10 位，示例：ABCDE12345）
+#   ASC_KEY_ID     App Store Connect API Key 的 Key ID
+#   ASC_ISSUER_ID  App Store Connect API Key 的 Issuer ID
+#   ASC_KEY_P8     App Store Connect API Key 的 .p8 私钥全文（含 BEGIN/END 行）
+#
+# 签名方式：自动签名（CODE_SIGN_STYLE=Automatic）+ Team ID 由构建设置注入，
+#          证书与描述文件由 Apple 在 archive 阶段通过 API Key 自动签发/下载。
+#
+# 说明：
+#   * 仓库根目录 ExportOptions.plist 为模板（含 ${APP_TEAM_ID} 占位符），
+#     本工作流运行时用 Secrets 替换后写入 runner 临时目录，仓库内不落明文 Team ID。
+#   * 原有的未签名构建链路（ios-build.yml）保持独立，本文件不影响它。
+#   * 触发方式：手动 workflow_dispatch，或推送 v* 标签。
+# ============================================================================
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_number:
+        description: "CFBundleVersion 构建号（留空则使用 workflow 运行号，确保每次上传唯一）"
+        required: false
+        default: ""
+      marketing_version:
+        description: "CFBundleShortVersionString（留空则取 project.yml 中的 0.1.3）"
+        required: false
+        default: ""
+  push:
+    tags:
+      - "v*"
+
+concurrency:
+  group: ios-testflight-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  testflight:
+    name: Archive, sign and upload to TestFlight
+    runs-on: macos-15
+    timeout-minutes: 60
+
+    env:
+      APP_TEAM_ID: ${{ secrets.APP_TEAM_ID }}
+      ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+      ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+      ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show toolchain versions
+        run: |
+          xcodebuild -version
+          sw_vers
+
+      - name: Check required secrets
+        run: |
+          set -eu
+          missing=""
+          for n in APP_TEAM_ID ASC_KEY_ID ASC_ISSUER_ID ASC_KEY_P8; do
+            eval "v=\${$n}"
+            if [ -z "$v" ]; then missing="$missing $n"; fi
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::缺少 Actions Secrets:$missing"
+            exit 1
+          fi
+          echo "Secrets 齐全（不打印任何值）"
+
+      - name: Write App Store Connect API key
+        run: |
+          set -eu
+          KEY_DIR="$RUNNER_TEMP/asc"
+          mkdir -p "$KEY_DIR"
+          KEY_PATH="$KEY_DIR/AuthKey_${ASC_KEY_ID}.p8"
+          # 兼容两种存法：Secrets 里带真实换行，或粘贴成字面量 \n
+          printf '%s' "$ASC_KEY_P8" | sed 's/\\n/\n/g' > "$KEY_PATH"
+          chmod 600 "$KEY_PATH"
+          echo "ASC_KEY_PATH=$KEY_PATH" >> "$GITHUB_ENV"
+          if openssl pkey -in "$KEY_PATH" -noout >/dev/null 2>&1 || openssl ec -in "$KEY_PATH" -noout >/dev/null 2>&1; then
+            echo "API Key 格式校验通过"
+          else
+            echo "::warning::未能校验 .p8 私钥格式，仍继续构建（若为密钥问题，archive 步骤会明确报错）"
+          fi
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        run: xcodegen generate
+
+      - name: Resolve Swift packages
+        run: |
+          xcodebuild -project TTYB.xcodeproj -scheme TTYB \
+            -resolvePackageDependencies
+
+      - name: Resolve version numbers
+        run: |
+          set -eu
+          BUILD_NUMBER="${{ github.event.inputs.build_number }}"
+          MARKETING="${{ github.event.inputs.marketing_version }}"
+          if [ -z "$BUILD_NUMBER" ]; then BUILD_NUMBER="${{ github.run_number }}"; fi
+          if [ -z "$MARKETING" ]; then
+            MARKETING=$(grep -m1 'MARKETING_VERSION' project.yml | awk '{print $2}' | tr -d '"')
+          fi
+          echo "MARKETING_VERSION=$MARKETING" >> "$GITHUB_ENV"
+          echo "BUILD_NUMBER=$BUILD_NUMBER" >> "$GITHUB_ENV"
+          echo "本次构建版本：$MARKETING ($BUILD_NUMBER)"
+
+      - name: Render ExportOptions.plist
+        run: |
+          set -eu
+          sed 's|\${APP_TEAM_ID}|'"$APP_TEAM_ID"'|g' ExportOptions.plist > "$RUNNER_TEMP/ExportOptions.plist"
+          plutil -lint "$RUNNER_TEMP/ExportOptions.plist"
+          if grep -q 'APP_TEAM_ID' "$RUNNER_TEMP/ExportOptions.plist"; then
+            echo "::error::ExportOptions.plist 中的 Team ID 占位符未被替换"
+            exit 1
+          fi
+          echo "ExportOptions.plist 已渲染（Team ID 来自 Secrets，未回显）"
+          echo "EXPORT_OPTIONS_PATH=$RUNNER_TEMP/ExportOptions.plist" >> "$GITHUB_ENV"
+
+      - name: Archive with automatic signing
+        run: |
+          set -eu
+          xcodebuild archive \
+            -project TTYB.xcodeproj \
+            -scheme TTYB \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$RUNNER_TEMP/TTYB.xcarchive" \
+            APP_TEAM_ID="$APP_TEAM_ID" \
+            DEVELOPMENT_TEAM="$APP_TEAM_ID" \
+            CODE_SIGN_STYLE=Automatic \
+            MARKETING_VERSION="$MARKETING_VERSION" \
+            CURRENT_PROJECT_VERSION="$BUILD_NUMBER" \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath "$ASC_KEY_PATH" \
+            -authenticationKeyID "$ASC_KEY_ID" \
+            -authenticationKeyIssuerID "$ASC_ISSUER_ID"
+
+      - name: Check archive
+        run: |
+          set -eu
+          APP_PLIST="$RUNNER_TEMP/TTYB.xcarchive/Products/Applications/TTYB.app/Info.plist"
+          if [ ! -f "$APP_PLIST" ]; then
+            echo "::error::未找到归档产物 TTYB.app/Info.plist"
+            exit 1
+          fi
+          echo "归档 App 版本：$(plutil -extract CFBundleShortVersionString raw -o - "$APP_PLIST") ($(plutil -extract CFBundleVersion raw -o - "$APP_PLIST"))"
+          echo "归档 App Bundle ID：$(plutil -extract CFBundleIdentifier raw -o - "$APP_PLIST")"
+
+      - name: Export and upload to TestFlight
+        run: |
+          set -eu
+          xcodebuild -exportArchive \
+            -archivePath "$RUNNER_TEMP/TTYB.xcarchive" \
+            -exportOptionsPlist "$EXPORT_OPTIONS_PATH" \
+            -exportPath "$RUNNER_TEMP/export" \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath "$ASC_KEY_PATH" \
+            -authenticationKeyID "$ASC_KEY_ID" \
+            -authenticationKeyIssuerID "$ASC_ISSUER_ID"
+          ls -l "$RUNNER_TEMP/export" || true
+
+      - name: Remove API key from runner
+        if: always()
+        run: |
+          rm -f "${ASC_KEY_PATH:-$RUNNER_TEMP/asc/unknown.p8}" || true
+
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: testflight-build-log
+          path: |
+            $RUNNER_TEMP/export/*.log
+            ~/Library/Developer/Xcode/DerivedData/**/Logs/Build/*.xcactivitylog
+            ~/Library/Logs/gym/*.log
+          if-no-files-found: ignore
+
+      - name: Summary
+        if: success()
+        run: |
+          echo "### 已上传 TestFlight" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "- 版本：$MARKETING_VERSION ($BUILD_NUMBER)" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Bundle ID：com.ttyb.mobile（自动签名，Team ID 由 Secrets 注入）" >> "$GITHUB_STEP_SUMMARY"
+          echo "- 下一步：在 App Store Connect → TestFlight 等待处理完成，添加站长到内部/外部测试组后分发。" >> "$GITHUB_STEP_SUMMARY"

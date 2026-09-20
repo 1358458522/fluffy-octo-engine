@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  TTYB 正式签名导出配置（App Store Connect / TestFlight 专用）
+
+  * 本文件是「模板」：teamID 值写成 ${APP_TEAM_ID} 占位符，
+    CI（.github/workflows/ios-testflight.yml）在运行时用 Secrets 里的真实 Team ID
+    替换到 $RUNNER_TEMP/ExportOptions.plist 后再交给 xcodebuild，
+    因此仓库内不出现明文 Team ID。
+  * 本地手工使用前，请先把 ${APP_TEAM_ID} 替换成真实 Team ID，否则 xcodebuild 会报签名错误。
+  * destination = upload：导出后由 xcodebuild 直接上传 App Store Connect（TestFlight）。
+    若所在 Xcode 版本不支持该取值，改为 export（只导出 ipa 不上传），
+    再自行用 Transporter 或 xcrun altool 的 upload-app 上传。
+-->
+<plist version="1.0">
+<dict>
+	<key>method</key>
+	<string>app-store-connect</string>
+	<key>destination</key>
+	<string>upload</string>
+	<key>signingStyle</key>
+	<string>automatic</string>
+	<key>teamID</key>
+	<string>${APP_TEAM_ID}</string>
+	<key>uploadSymbols</key>
+	<true/>
+	<key>stripSwiftSymbols</key>
+	<true/>
+	<key>manageAppVersionAndBuildNumber</key>
+	<false/>
+	<key>generateAppStoreInformation</key>
+	<false/>
+</dict>
+</plist>

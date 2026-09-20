@@ -9,7 +9,7 @@ options:
 settings:
   base:
     MARKETING_VERSION: "0.1.3"
-    CURRENT_PROJECT_VERSION: "4"
+    CURRENT_PROJECT_VERSION: "5"
     SWIFT_VERSION: "5.9"
 
 packages:
@@ -41,11 +41,11 @@ targets:
         PRODUCT_NAME: TTYB
         TARGETED_DEVICE_FAMILY: "1"
         GENERATE_INFOPLIST_FILE: NO
-        CODE_SIGN_STYLE: Manual
-        CODE_SIGNING_REQUIRED: NO
-        CODE_SIGNING_ALLOWED: NO
-        CODE_SIGN_IDENTITY: ""
-        DEVELOPMENT_TEAM: ""
+        # 正式签名：自动签名，Team ID 由构建设置注入
+        # （CI 传 APP_TEAM_ID=<TeamID>，见 .github/workflows/ios-testflight.yml；
+        #   纯未签名构建由 ios-build.yml 用 CODE_SIGNING_ALLOWED=NO 覆盖，不受影响）
+        CODE_SIGN_STYLE: Automatic
+        DEVELOPMENT_TEAM: $(APP_TEAM_ID)
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
     dependencies:
       - package: SQLServerKit

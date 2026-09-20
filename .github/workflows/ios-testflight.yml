@@ -103,12 +103,18 @@ jobs:
       - name: Resolve version numbers
         run: |
           set -eu
-          BUILD_NUMBER="${{ github.event.inputs.build_number }}"
-          MARKETING="${{ github.event.inputs.marketing_version }}"
+          # 注意：project.yml 由 Windows 维护，为 CRLF 换行。任何取值都必须去掉 \r，
+          # 否则版本号尾部带回车，App Store Connect 会报
+          # "CFBundleShortVersionString ... must be composed of one to three period-separated integers"。
+          strip() { tr -d '"\r\n[:space:]'; }
+          BUILD_NUMBER="$(printf '%s' '${{ github.event.inputs.build_number }}' | strip)"
+          MARKETING="$(printf '%s' '${{ github.event.inputs.marketing_version }}' | strip)"
           if [ -z "$BUILD_NUMBER" ]; then BUILD_NUMBER="${{ github.run_number }}"; fi
           if [ -z "$MARKETING" ]; then
-            MARKETING=$(grep -m1 'MARKETING_VERSION' project.yml | awk '{print $2}' | tr -d '"')
+            MARKETING="$(awk '/^[[:space:]]*MARKETING_VERSION:/{print $2; exit}' project.yml | strip)"
           fi
+          echo "$MARKETING" | grep -Eq '^[0-9]+(\.[0-9]+){0,2}$' || { echo "::error::MARKETING_VERSION 非法：[$MARKETING]"; exit 1; }
+          echo "$BUILD_NUMBER" | grep -Eq '^[0-9]+$' || { echo "::error::构建号非法：[$BUILD_NUMBER]"; exit 1; }
           echo "MARKETING_VERSION=$MARKETING" >> "$GITHUB_ENV"
           echo "BUILD_NUMBER=$BUILD_NUMBER" >> "$GITHUB_ENV"
           echo "本次构建版本：$MARKETING ($BUILD_NUMBER)"

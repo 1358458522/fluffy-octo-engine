@@ -41,7 +41,9 @@ concurrency:
 jobs:
   testflight:
     name: Archive, sign and upload to TestFlight
-    runs-on: macos-15
+    # 必须使用 Xcode 26（iOS 26 SDK）：App Store Connect 已拒绝 iOS 18 SDK 构建的包
+    # （报 "SDK version issue ... must be built with the iOS 26 SDK or later"）。
+    runs-on: macos-26
     timeout-minutes: 60
 
     env:
@@ -53,6 +55,15 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Select Xcode 26 (iOS 26 SDK)
+        run: |
+          set -eu
+          XC="$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -n1 || true)"
+          if [ -z "$XC" ]; then XC="$(ls -d /Applications/Xcode*.app 2>/dev/null | sort -V | tail -n1 || true)"; fi
+          if [ -n "$XC" ]; then echo "选中 $XC"; sudo xcode-select -s "$XC/Contents/Developer"; fi
+          xcodebuild -version
+          xcodebuild -showsdks | grep -i iphoneos || true
 
       - name: Show toolchain versions
         run: |

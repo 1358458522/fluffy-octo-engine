@@ -34,6 +34,23 @@ struct DayAggregate {
     var template: ShiftTemplate?
 }
 
+/// 一个站点某营业日区间（含起止两端）的取数结果。
+struct RangeAggregate {
+    var from: String = ""
+    var to: String = ""
+    /// 区间内有数据的营业日数
+    var days: Int = 0
+    var count: Int = 0
+    var amount: Double = 0
+    var volume: Double = 0
+    var firstTime: String? = nil
+    var lastTime: String? = nil
+    /// 按营业日拆分
+    var daily: [DailyStat] = []
+    /// 按油品（只统计升数口径）
+    var products: [ProductStat] = []
+}
+
 enum DatabaseService {
 
     // MARK: - 建连（单站串行 + 连接复用 + 全程留痕）
@@ -387,42 +404,89 @@ enum DatabaseService {
         return ShiftTemplate(refDate: refDate, windows: windows)
     }
 
-    // MARK: - 逐笔明细
+    // MARK: - 逐笔明细（取消 500 笔上限）
 
+    /// 逐笔明细查询，`pageSize` 控制是否分页：
+    /// - `pageSize == nil`：不带 TOP、不带分页，一次性返回范围内**全部**明细（原「最多 500 笔」限制已取消）；
+    /// - `pageSize != nil`：用 ROW_NUMBER 分页（云库为 SQL Server 2008 R2，不支持 OFFSET / FETCH），
+    ///   并附带 COUNT 总数，供长区间「按需加载」使用，避免一次性拉爆内存。
+    /// - Parameters:
+    ///   - from: 起始营业日（yyyy-MM-dd）
+    ///   - to: 结束营业日（yyyy-MM-dd）；传 nil 或与 from 相同即为单日查询
     static func fetchTrades(
         _ station: Station,
-        date: String,
+        from: String,
+        to: String? = nil,
         shift: Int? = nil,
-        limit: Int = 500
-    ) async throws -> [TradeRow] {
+        offset: Int = 0,
+        pageSize: Int? = nil
+    ) async throws -> TradePage {
         try await withClient(station) { client in
-            var condition = "t.FBusinessDate = '\(date)'"
+            var condition = "t.FBusinessDate = '\(from)'"
+            if let to, !to.isEmpty, to != from {
+                condition = "t.FBusinessDate >= '\(from)' AND t.FBusinessDate <= '\(to)'"
+            }
             if let shift {
                 condition += " AND t.FBusinessShiftNo = \(shift)"
             }
 
-            let sql = """
-            SELECT TOP \(limit)
-                   CONVERT(varchar(19), t.FTradeTime, 120) AS tradeTime,
-                   CAST(ISNULL(t.FBusinessShiftNo, 0) AS int) AS shiftNo,
-                   CAST(ISNULL(t.FFipID, '') AS nvarchar(50)) AS fipID,
-                   CAST(ISNULL(p.FProductName, '') AS nvarchar(100)) AS productName,
-                   CAST(ISNULL(t.FTradeVolume, 0) AS float) AS vol,
-                   CAST(ISNULL(t.FTradeAmount, 0) AS float) AS amt,
-                   CAST(ISNULL(t.FPayMode, '') AS nvarchar(50)) AS payMode,
-                   CAST(ISNULL(t.FAttendant, '') AS nvarchar(50)) AS attendant,
-                   CAST(ISNULL(t.FPaid, 0) AS int) AS paid,
-                   CAST(ISNULL(t.FMakeout, 0) AS int) AS makeout
+            let fromClause = """
             FROM TFuelTradeRecord t WITH (NOLOCK)
             LEFT JOIN TProduct p WITH (NOLOCK) ON p.FProductSN = t.FProductSN
-            WHERE \(condition)
-            ORDER BY t.FTradeTime DESC
             """
 
-            Diag.log("查询: 逐笔明细 \(date) 班次\(shift.map(String.init) ?? "全部")")
+            let scroll = max(offset, 0)
+            var sql: String
+            var total = -1
+
+            if let pageSize, pageSize > 0 {
+                total = try await tradeCount(client, condition: condition, fromClause: fromClause)
+                let upper = scroll + pageSize
+                sql = """
+                SELECT CONVERT(varchar(19), page.FTradeTime, 120) AS tradeTime,
+                       CAST(ISNULL(page.FBusinessShiftNo, 0) AS int) AS shiftNo,
+                       CAST(ISNULL(page.FFipID, '') AS nvarchar(50)) AS fipID,
+                       CAST(ISNULL(page.FProductName, '') AS nvarchar(100)) AS productName,
+                       CAST(ISNULL(page.FTradeVolume, 0) AS float) AS vol,
+                       CAST(ISNULL(page.FTradeAmount, 0) AS float) AS amt,
+                       CAST(ISNULL(page.FPayMode, '') AS nvarchar(50)) AS payMode,
+                       CAST(ISNULL(page.FAttendant, '') AS nvarchar(50)) AS attendant,
+                       CAST(ISNULL(page.FPaid, 0) AS int) AS paid,
+                       CAST(ISNULL(page.FMakeout, 0) AS int) AS makeout
+                FROM (
+                    SELECT t.FTradeTime, t.FBusinessShiftNo, t.FFipID, p.FProductName,
+                           t.FTradeVolume, t.FTradeAmount, t.FPayMode, t.FAttendant,
+                           t.FPaid, t.FMakeout,
+                           ROW_NUMBER() OVER (ORDER BY t.FTradeTime DESC) AS rn
+                    \(fromClause)
+                    WHERE \(condition)
+                ) AS page
+                WHERE page.rn > \(scroll) AND page.rn <= \(upper)
+                ORDER BY page.rn
+                """
+            } else {
+                sql = """
+                SELECT CONVERT(varchar(19), t.FTradeTime, 120) AS tradeTime,
+                       CAST(ISNULL(t.FBusinessShiftNo, 0) AS int) AS shiftNo,
+                       CAST(ISNULL(t.FFipID, '') AS nvarchar(50)) AS fipID,
+                       CAST(ISNULL(p.FProductName, '') AS nvarchar(100)) AS productName,
+                       CAST(ISNULL(t.FTradeVolume, 0) AS float) AS vol,
+                       CAST(ISNULL(t.FTradeAmount, 0) AS float) AS amt,
+                       CAST(ISNULL(t.FPayMode, '') AS nvarchar(50)) AS payMode,
+                       CAST(ISNULL(t.FAttendant, '') AS nvarchar(50)) AS attendant,
+                       CAST(ISNULL(t.FPaid, 0) AS int) AS paid,
+                       CAST(ISNULL(t.FMakeout, 0) AS int) AS makeout
+                \(fromClause)
+                WHERE \(condition)
+                ORDER BY t.FTradeTime DESC
+                """
+            }
+
+            Diag.log("查询: 逐笔明细 \(from) ~ \(to ?? "同单日") 班次\(shift.map(String.init) ?? "全部") 页大小\(pageSize.map(String.init) ?? "全量")")
             let rows = try await client.query(sql)
             Diag.log("查询: 逐笔明细返回 \(rows.count) 行")
-            return rows.map { row in
+            var page = TradePage()
+            page.rows = rows.map { row in
                 let paid = row.column("paid")?.int ?? 0
                 let makeout = row.column("makeout")?.int ?? 0
                 let state = makeout != 0 ? "挂账" : (paid != 0 ? "已支付" : "未支付")
@@ -438,6 +502,136 @@ enum DatabaseService {
                     paidState: state
                 )
             }
+            page.offset = scroll
+            page.total = total >= 0 ? total : scroll + page.rows.count
+            return page
         }
+    }
+
+    /// 范围内总笔数。与分页查询使用同一 JOIN 口径，保证总数与明细一致（不再有任何截断）。
+    private static func tradeCount(
+        _ client: SQLServerClient,
+        condition: String,
+        fromClause: String
+    ) async throws -> Int {
+        let sql = """
+        SELECT COUNT(*) AS total
+        \(fromClause)
+        WHERE \(condition)
+        """
+        let rows = try await client.query(sql)
+        return rows.first?.column("total")?.int ?? 0
+    }
+
+    // MARK: - 营业日区间汇总（含起止两端）
+
+    /// 区间汇总：合计（营业额 / 油量 / 笔数 / 首末笔时间）+ 按营业日拆分 + 按油品。
+    /// 口径与单日一致：按油品只统计升数，不做按支付方式统计。
+    static func fetchRange(_ station: Station, from: String, to: String) async throws -> RangeAggregate {
+        try await withClient(station) { client in
+            var aggregate = RangeAggregate(from: from, to: to)
+            let range = "FBusinessDate >= '\(from)' AND FBusinessDate <= '\(to)'"
+
+            let totalSQL = """
+            SELECT COUNT(*) AS cnt,
+                   CAST(ISNULL(SUM(FTradeAmount), 0) AS float) AS amt,
+                   CAST(ISNULL(SUM(FTradeVolume), 0) AS float) AS vol,
+                   CONVERT(varchar(19), MIN(FTradeTime), 120) AS tmin,
+                   CONVERT(varchar(19), MAX(FTradeTime), 120) AS tmax
+            FROM TFuelTradeRecord WITH (NOLOCK)
+            WHERE \(range)
+            """
+
+            Diag.log("查询: 区间合计 \(from) ~ \(to)")
+            if let rows = try? await client.query(totalSQL), let row = rows.first {
+                aggregate.count = row.column("cnt")?.int ?? 0
+                aggregate.amount = row.column("amt")?.double ?? 0
+                aggregate.volume = row.column("vol")?.double ?? 0
+                aggregate.firstTime = row.column("tmin")?.string
+                aggregate.lastTime = row.column("tmax")?.string
+            }
+
+            let dailySQL = """
+            SELECT CONVERT(varchar(10), FBusinessDate, 120) AS d,
+                   COUNT(*) AS cnt,
+                   CAST(ISNULL(SUM(FTradeAmount), 0) AS float) AS amt,
+                   CAST(ISNULL(SUM(FTradeVolume), 0) AS float) AS vol
+            FROM TFuelTradeRecord WITH (NOLOCK)
+            WHERE \(range)
+            GROUP BY CONVERT(varchar(10), FBusinessDate, 120)
+            ORDER BY d
+            """
+
+            Diag.log("查询: 区间按营业日")
+            if let rows = try? await client.query(dailySQL) {
+                aggregate.daily = rows.map { row in
+                    DailyStat(
+                        date: row.column("d")?.string ?? "",
+                        count: row.column("cnt")?.int ?? 0,
+                        amount: row.column("amt")?.double ?? 0,
+                        volume: row.column("vol")?.double ?? 0
+                    )
+                }
+            }
+            aggregate.days = aggregate.daily.count
+
+            Diag.log("查询: 区间按油品汇总")
+            aggregate.products = await rangeProductStats(client, range: range)
+            Diag.log("查询: 区间取数完成 \(aggregate.count) 笔 / \(aggregate.days) 个营业日")
+            return aggregate
+        }
+    }
+
+    // MARK: - 区间按油品（口径同单日：只统计升数）
+
+    private static func rangeProductStats(_ client: SQLServerClient, range: String) async -> [ProductStat] {
+        let joinedSQL = """
+        SELECT CAST(t.FProductSN AS nvarchar(50)) AS pSn,
+               CAST(p.FProductName AS nvarchar(100)) AS pName,
+               COUNT(*) AS cnt,
+               CAST(ISNULL(SUM(t.FTradeVolume), 0) AS float) AS vol,
+               CAST(ISNULL(SUM(t.FTradeAmount), 0) AS float) AS amt
+        FROM TFuelTradeRecord t WITH (NOLOCK)
+        LEFT JOIN TProduct p WITH (NOLOCK) ON p.FProductSN = t.FProductSN
+        WHERE \(range)
+        GROUP BY t.FProductSN, p.FProductName
+        ORDER BY SUM(t.FTradeAmount) DESC
+        """
+
+        let plainSQL = """
+        SELECT CAST(FProductSN AS nvarchar(50)) AS pSn,
+               CAST('' AS nvarchar(100)) AS pName,
+               COUNT(*) AS cnt,
+               CAST(ISNULL(SUM(FTradeVolume), 0) AS float) AS vol,
+               CAST(ISNULL(SUM(FTradeAmount), 0) AS float) AS amt
+        FROM TFuelTradeRecord WITH (NOLOCK)
+        WHERE \(range)
+        GROUP BY FProductSN
+        ORDER BY SUM(FTradeAmount) DESC
+        """
+
+        if let rows = try? await client.query(joinedSQL) {
+            return rows.map { row in
+                ProductStat(
+                    code: row.column("pSn")?.string ?? "",
+                    name: row.column("pName")?.string ?? "",
+                    count: row.column("cnt")?.int ?? 0,
+                    volume: row.column("vol")?.double ?? 0,
+                    amount: row.column("amt")?.double ?? 0
+                )
+            }
+        }
+        if let rows = try? await client.query(plainSQL) {
+            return rows.map { row in
+                ProductStat(
+                    code: row.column("pSn")?.string ?? "",
+                    name: row.column("pName")?.string ?? "",
+                    count: row.column("cnt")?.int ?? 0,
+                    volume: row.column("vol")?.double ?? 0,
+                    amount: row.column("amt")?.double ?? 0
+                )
+            }
+        }
+        return []
     }
 }

@@ -184,6 +184,48 @@ struct TradeRow: Identifiable, Hashable {
     var paidState: String
 }
 
+// MARK: - 营业日区间与明细分页
+
+/// 区间内某一天的汇总（按营业日拆分）
+struct DailyStat: Identifiable, Hashable {
+    var id: String { date }
+    var date: String
+    var count: Int
+    var amount: Double
+    var volume: Double
+}
+
+/// 一个站点在某营业日区间（含起止两端）内的汇总
+struct DateRangeResult: Identifiable {
+    let id: UUID
+    var stationName: String
+    var from: String
+    var to: String
+    /// 区间内有数据的营业日数
+    var days: Int = 0
+    var count: Int = 0
+    var amount: Double = 0
+    var volume: Double = 0
+    var firstTime: String? = nil
+    var lastTime: String? = nil
+    /// 按营业日拆分
+    var daily: [DailyStat] = []
+    /// 按油品（沿用「只统计升数」口径）
+    var products: [ProductStat] = []
+    var error: String? = nil
+    var updatedAt: Date
+}
+
+/// 逐笔明细一页结果。`pageSize` 传 nil 时表示一次性全量（total = 实际行数）。
+struct TradePage {
+    var rows: [TradeRow] = []
+    /// 范围内总笔数
+    var total: Int = 0
+    /// 本页起始偏移（0 起）
+    var offset: Int = 0
+    var hasMore: Bool { offset + rows.count < total }
+}
+
 // MARK: - 格式化
 
 enum Fmt {

@@ -46,6 +46,42 @@ enum RevenueService {
         }
     }
 
+    /// 拉取单个站点某营业日区间（含起止两端）的汇总：合计 + 按营业日 + 按油品。
+    /// 口径与单日一致（按油品只统计升数）；区间跨多日，不做交班状态判定。
+    static func refreshRange(_ station: Station, from: String, to: String) async -> DateRangeResult {
+        Diag.log("【取数】开始区间 \(station.name) \(from) ~ \(to)")
+        do {
+            let aggregate = try await DatabaseService.fetchRange(station, from: from, to: to)
+            Diag.log("【取数】区间成功 \(station.name)：\(aggregate.count) 笔 / \(aggregate.days) 个营业日")
+            return DateRangeResult(
+                id: station.id,
+                stationName: station.name,
+                from: from,
+                to: to,
+                days: aggregate.days,
+                count: aggregate.count,
+                amount: aggregate.amount,
+                volume: aggregate.volume,
+                firstTime: aggregate.firstTime,
+                lastTime: aggregate.lastTime,
+                daily: aggregate.daily,
+                products: aggregate.products,
+                error: nil,
+                updatedAt: Date()
+            )
+        } catch {
+            Diag.log("【取数】区间失败 \(station.name)：\(error)")
+            return DateRangeResult(
+                id: station.id,
+                stationName: station.name,
+                from: from,
+                to: to,
+                error: friendly(error),
+                updatedAt: Date()
+            )
+        }
+    }
+
     /// 逐站串行拉取（当前唯一允许的批量方式）：一次只查一个站点，查完再查下一个。
     /// 与电脑端一致，不再对云库发起任何并发连接。
     /// - Parameter onProgress: 每站开始前回调 (已完成数, 总数, 站点名)

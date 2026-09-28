@@ -377,9 +377,37 @@ struct StationDetailView: View {
                     .foregroundStyle(.secondary)
             }
         } header: {
-            Text("全天按油品")
+            HStack {
+                Text("全天按油品")
+                Spacer()
+                Button {
+                    shareOilImage()
+                } label: {
+                    Image(systemName: "square.and.arrow.up")
+                }
+                .disabled(!canShareOilImage)
+                .accessibilityLabel("分享油品升数小图")
+            }
         } footer: {
             Text("按油品只统计升数。")
+        }
+    }
+
+    /// 当前已有可分享的按油品升数数据（无报错且有数据）
+    private var canShareOilImage: Bool {
+        guard let result, result.error == nil else { return false }
+        return !result.products.isEmpty
+    }
+
+    /// 生成只含各油品升数的白底小卡片并调起系统分享面板
+    private func shareOilImage() {
+        guard let products = result?.products, !products.isEmpty else { return }
+        do {
+            let url = try OilCardImage.render(products)
+            exportItems = [url]
+            showShare = true
+        } catch {
+            alert = AlertPayload(title: "生成失败", message: error.localizedDescription)
         }
     }
 

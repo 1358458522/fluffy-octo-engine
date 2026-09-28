@@ -1,4 +1,5 @@
 import Foundation
+import UIKit
 
 enum CSVExporter {
 
@@ -155,6 +156,73 @@ enum CSVExporter {
         // 加 BOM，保证 Excel 打开中文不乱码
         var data = Data([0xEF, 0xBB, 0xBF])
         data.append(Data(content.utf8))
+        try data.write(to: url, options: .atomic)
+        return url
+    }
+}
+
+/// 「按油品升数」白底小卡片 PNG（只含各油品升数，不含站名与日期），供系统分享面板发送
+enum OilCardImage {
+
+    static func render(_ products: [ProductStat]) throws -> URL {
+        guard !products.isEmpty else {
+            throw NSError(domain: "OilCardImage", code: 1,
+                          userInfo: [NSLocalizedDescriptionKey: "没有可分享的油品数据"])
+        }
+
+        let rows = products.map { (name: $0.name.isEmpty ? $0.code : $0.name,
+                                   value: "\(Fmt.volume($0.volume)) 升") }
+
+        // 布局（pt）：560 宽白底卡片，上下留白 + 每行一行油品
+        let sidePadding: CGFloat = 40
+        let topBottom: CGFloat = 44
+        let rowHeight: CGFloat = 64
+        let width: CGFloat = 560
+        let height = topBottom * 2 + CGFloat(rows.count) * rowHeight
+
+        let nameFont = UIFont.systemFont(ofSize: 30, weight: .regular)
+        let valueFont = UIFont.monospacedDigitSystemFont(ofSize: 30, weight: .semibold)
+
+        let renderer = UIGraphicsImageRenderer(size: CGSize(width: width, height: height))
+        let image = renderer.image { ctx in
+            UIColor.white.setFill()
+            ctx.fill(CGRect(x: 0, y: 0, width: width, height: height))
+
+            for (index, row) in rows.enumerated() {
+                let y = topBottom + CGFloat(index) * rowHeight
+                // 垂直居中
+                let nameAttrs: [NSAttributedString.Key: Any] = [
+                    .font: nameFont,
+                    .foregroundColor: UIColor.black
+                ]
+                let nameBaseline = y + (rowHeight - nameFont.lineHeight) / 2
+                (row.name as NSString).draw(
+                    at: CGPoint(x: sidePadding, y: nameBaseline),
+                    withAttributes: nameAttrs
+                )
+
+                let valueAttrs: [NSAttributedString.Key: Any] = [
+                    .font: valueFont,
+                    .foregroundColor: UIColor.black
+                ]
+                let valueSize = (row.value as NSString).size(withAttributes: valueAttrs)
+                (row.value as NSString).draw(
+                    at: CGPoint(x: width - sidePadding - valueSize.width, y: y + (rowHeight - valueSize.height) / 2),
+                    withAttributes: valueAttrs
+                )
+            }
+        }
+
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("ttyb-export", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyyMMdd_HHmmss"
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        let url = dir.appendingPathComponent("油品升数_\(formatter.string(from: Date())).png")
+        guard let data = image.pngData() else {
+            throw NSError(domain: "OilCardImage", code: 2,
+                          userInfo: [NSLocalizedDescriptionKey: "PNG 编码失败"])
+        }
         try data.write(to: url, options: .atomic)
         return url
     }

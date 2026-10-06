@@ -20,8 +20,6 @@ struct StationDetailView: View {
     @State private var trades: [TradeRow] = []
     @State private var isLoading = false
     @State private var isLoadingTrades = false
-    @State private var showShare = false
-    @State private var exportItems: [Any] = []
     @State private var alert: AlertPayload?
 
     // 营业日区间
@@ -110,7 +108,6 @@ struct StationDetailView: View {
                 .accessibilityLabel("重新查询")
             }
         }
-        .sheet(isPresented: $showShare) { ShareSheet(items: exportItems) }
         .alert(item: $alert) { payload in
             Alert(title: Text(payload.title), message: Text(payload.message), dismissButton: .default(Text("好")))
         }
@@ -399,15 +396,46 @@ struct StationDetailView: View {
         return !result.products.isEmpty
     }
 
-    /// 生成只含各油品升数的白底小卡片并调起系统分享面板
+    /// 获取当前可用的顶层 UIViewController：
+    /// 遍历 connectedScenes 找前台激活 scene 的 keyWindow，取其 rootViewController，
+    /// 再沿 presentedViewController 链下探到最顶层，用于直接 present 分享面板。
+    private func topPresentingViewController() -> UIViewController? {
+        guard let scene = UIApplication.shared.connectedScenes
+            .compactMap({ $0 as? UIWindowScene })
+            .first(where: { $0.activationState == .foregroundActive }),
+            let root = scene.windows.first(where: { $0.isKeyWindow })?.rootViewController
+        else { return nil }
+        var top = root
+        while let presented = top.presentedViewController {
+            top = presented
+        }
+        return top
+    }
+
+    /// 直接以 UIKit 方式 present 系统分享面板（绕过 SwiftUI sheet 首次呈现兼容性 bug）
+    private func presentShare(_ items: [Any]) {
+        guard let top = topPresentingViewController() else {
+            alert = AlertPayload(title: "无法打开分享", message: "未找到可用的视图控制器。")
+            return
+        }
+        let share = UIActivityViewController(activityItems: items, applicationActivities: nil)
+        // iPad 上 UIActivityViewController 必须提供 popover 锚点，否则崩溃
+        if let popover = share.popoverPresentationController {
+            popover.sourceView = top.view
+            popover.sourceRect = CGRect(x: top.view.bounds.midX, y: top.view.bounds.maxY, width: 0, height: 0)
+            popover.permittedArrowDirections = []
+        }
+        top.present(share, animated: true, completion: nil)
+    }
+
+    /// 生成只含各油品升数的白底小卡片并直接以 UIKit present 调起分享面板
     private func shareOilImage() {
         guard let products = result?.products, !products.isEmpty else { return }
         do {
-            // 直接分享 UIImage：系统同步拿到图片数据，预览立即可见，
-            // 避免首次弹出时文件 URL 的 QuickLook 预览尚未加载导致的空白
+            // 同步渲染得到 UIImage，用自定义 UIActivityItemSource 包裹后
+            // 直接 present UIActivityViewController，绕过 SwiftUI sheet 首次空白
             let image = try OilCardImage.renderImage(products)
-            exportItems = [image]
-            showShare = true
+            presentShare([OilCardItemSource(image: image)])
         } catch {
             alert = AlertPayload(title: "生成失败", message: error.localizedDescription)
         }
@@ -731,8 +759,7 @@ struct StationDetailView: View {
                 shift: tradesShift,
                 label: label
             )
-            exportItems = [url]
-            showShare = true
+            presentShare([url])
         } catch {
             alert = AlertPayload(title: "导出失败", message: error.localizedDescription)
         }
@@ -742,8 +769,7 @@ struct StationDetailView: View {
         guard let rangeResult else { return }
         do {
             let url = try CSVExporter.writeRange(rangeResult, stationName: station.name)
-            exportItems = [url]
-            showShare = true
+            presentShare([url])
         } catch {
             alert = AlertPayload(title: "导出失败", message: error.localizedDescription)
         }

@@ -234,3 +234,39 @@ enum OilCardImage {
         return url
     }
 }
+
+/// 分享油品小图的自定义 UIActivityItemSource：
+/// - placeholderItem 与 itemForActivityType 都直接返回 UIImage，
+///   系统同步即可取得图片数据，绕过文件 URL 的 QuickLook 异步缩略图加载，
+///   根治「首次点击分享面板内容区空白」问题；
+/// - subject 固定为「油品升数」，便于邮件/信息等场景使用。
+final class OilCardItemSource: NSObject, UIActivityItemSource {
+    private let image: UIImage
+    private let subject: String
+
+    init(image: UIImage, subject: String = "油品升数") {
+        self.image = image
+        self.subject = subject
+        super.init()
+    }
+
+    func activityViewControllerPlaceholderItem(
+        _ activityViewController: UIActivityViewController
+    ) -> Any {
+        image
+    }
+
+    func activityViewController(
+        _ activityViewController: UIActivityViewController,
+        itemForActivityType activityType: UIActivity.ActivityType?
+    ) -> Any? {
+        image
+    }
+
+    func activityViewController(
+        _ activityViewController: UIActivityViewController,
+        subjectForActivityType activityType: UIActivity.ActivityType?
+    ) -> String {
+        subject
+    }
+}

@@ -30,8 +30,10 @@ struct DayAggregate {
     var products: [ProductStat] = []
     /// 全天按支付方式（跨全部班次）
     var pays: [PayStat] = []
-    /// 班次时段模板（交班判定用）
+    /// 班次时段模板（交班判定兜底用）
     var template: ShiftTemplate?
+    /// 交班事实（TFuelTradeShiftFIP 查询日聚合，交班判定主用）
+    var facts: [Int: ShiftFact] = [:]
 }
 
 /// 一个站点某营业日区间（含起止两端）的取数结果。
@@ -275,9 +277,12 @@ enum DatabaseService {
             aggregate.products = await productStats(client, date: date)
             Diag.log("查询: 按支付方式汇总")
             aggregate.pays = await payStats(client, date: date)
-            // 班次时段模板（交班判定使用）
+            // 班次时段模板（交班判定兜底）
             Diag.log("查询: 班次时段模板")
             aggregate.template = await shiftTemplate(client, date: date)
+            // 交班事实（TFuelTradeShiftFIP，交班判定主用）
+            Diag.log("查询: 交班事实")
+            aggregate.facts = await shiftFacts(client, date: date)
             Diag.log("查询: 当日取数完成")
             return aggregate
         }
@@ -402,6 +407,43 @@ enum DatabaseService {
 
         guard let refDate = bestDay, let windows = byDay[refDate], !windows.isEmpty else { return nil }
         return ShiftTemplate(refDate: refDate, windows: windows)
+    }
+
+    // MARK: - 交班事实（TFuelTradeShiftFIP 查询日聚合）
+
+    /// 查询某站点某营业日的交班事实：按班次号聚合 TFuelTradeShiftFIP，
+    /// 取每班次实际开班时间 MIN(FOpenShiftTime) / 交班时间 MAX(FCloseShiftTime)。
+    /// 查询范围覆盖查询日及其前 1 日（交班事实跨日延续时以前一日补齐）。
+    /// 查询失败或查无事实时返回空字典，由上层走模板兜底。
+    static func fetchShiftFacts(_ station: Station, date: String) async throws -> [Int: ShiftFact] {
+        try await withClient(station) { client in
+            await shiftFacts(client, date: date)
+        }
+    }
+
+    /// 私有实现：在已建立连接的 client 上直接查询事实表（供 fetchDay 与公开入口共用）。
+    private static func shiftFacts(_ client: SQLServerClient, date: String) async -> [Int: ShiftFact] {
+        let sql = """
+        SELECT FBusinessShiftNo AS shiftNo,
+               CONVERT(varchar(19), MIN(FOpenShiftTime), 120) AS open_t,
+               CONVERT(varchar(19), MAX(FCloseShiftTime), 120) AS close_t
+        FROM TFuelTradeShiftFIP WITH (NOLOCK)
+        WHERE FBusinessDate >= DATEADD(day, -1, CAST('\(date)' AS date))
+          AND FBusinessDate <= CAST('\(date)' AS date)
+        GROUP BY FBusinessShiftNo
+        ORDER BY FBusinessShiftNo
+        """
+
+        var facts: [Int: ShiftFact] = [:]
+        guard let rows = try? await client.query(sql) else { return facts }
+        for row in rows {
+            let shift = row.column("shiftNo")?.int ?? 0
+            facts[shift] = ShiftFact(
+                open: Fmt.parse(row.column("open_t")?.string),
+                close: Fmt.parse(row.column("close_t")?.string)
+            )
+        }
+        return facts
     }
 
     // MARK: - 逐笔明细（取消 500 笔上限）

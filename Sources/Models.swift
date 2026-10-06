@@ -152,6 +152,15 @@ struct ShiftTemplate {
     }
 }
 
+/// 交班事实（来自云库 TFuelTradeShiftFIP 事实表，按查询日聚合）：
+/// 某班次在查询日的实际开班 / 交班时刻，优先于模板猜测用于交班判定。
+struct ShiftFact {
+    /// 该班次开班时间
+    var open: Date?
+    /// 该班次交班时间；close 无效（close <= open，即仍在进行中的占位）时按未交班处理
+    var close: Date?
+}
+
 /// 一个站点的当日结果（全天口径）
 struct StationResult: Identifiable {
     let id: UUID

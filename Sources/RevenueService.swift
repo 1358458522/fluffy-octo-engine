@@ -106,29 +106,46 @@ enum RevenueService {
 
     // MARK: - 交班状态（与电脑端 judge_shift_status 同算法）
 
-    /// 给每个班次打上交班状态
+    /// 给每个班次打上交班状态（事实判定优先，模板兜底）
     static func statusApplied(
         _ shifts: [ShiftRevenue],
         template: ShiftTemplate?,
+        facts: [Int: ShiftFact]?,
         date: String,
         now: Date = Date()
     ) -> [ShiftRevenue] {
         shifts.map { shift in
             var item = shift
-            item.timing = judge(shift, template: template, date: date, now: now)
+            item.timing = judge(shift, template: template, facts: facts, date: date, now: now)
             return item
         }
     }
 
     /// 单班次交班判定：
-    /// - 有模板：模板基准日同班次时段整体平移到查询日，与当前时间比较
-    /// - 无模板：末笔交易距今 > 90 分钟视为已交班（兜底，与电脑端一致）
+    /// 1) 有交班事实（TFuelTradeShiftFIP）：按实际开班 / 交班时刻判定；
+    /// 2) 事实缺失：回退到原模板近似判定（模板基准日时段平移到查询日）；
+    /// 3) 模板也缺失：末笔交易距今 > 90 分钟视为已交班（兜底，与电脑端一致）。
     static func judge(
         _ shift: ShiftRevenue,
         template: ShiftTemplate?,
+        facts: [Int: ShiftFact]?,
         date: String,
         now: Date = Date()
     ) -> ShiftTiming {
+        // —— 事实判定（主用）——
+        if let facts, let fact = facts[shift.shift], let open = fact.open {
+            let close = fact.close
+            // close 有效（> open，真实交班时间）且已过交班点 + 3 分钟缓冲 → 已交班
+            if let close, close > open, now >= close.addingTimeInterval(3 * 60) {
+                return .closed
+            }
+            // 已开班且未满足已交班 → 营业中
+            if now >= open { return .running }
+            // 未到开班时间 → 未到交班点
+            return .notYet
+        }
+
+        // —— 模板近似判定（事实缺失时兜底）——
         if let template,
            let window = template.windows[shift.shift],
            let refDay = Fmt.parseDay(template.refDate) {
@@ -142,7 +159,7 @@ enum RevenueService {
 
             guard let begin = calendar.date(byAdding: .day, value: days, to: window.begin),
                   let end = calendar.date(byAdding: .day, value: days, to: window.end) else {
-                return fallbackTiming(shift.lastTime, now: now)
+                return fallbackTiming(shift.firstTime, shift.lastTime, now: now)
             }
 
             // 模板 end 为该班次末笔交易时间，交班动作通常在其后 1~2 分钟完成；
@@ -151,11 +168,13 @@ enum RevenueService {
             if now >= begin { return .running }
             return .notYet
         }
-        return fallbackTiming(shift.lastTime, now: now)
+        return fallbackTiming(shift.firstTime, shift.lastTime, now: now)
     }
 
-    /// 模板缺失时的兜底判定
-    private static func fallbackTiming(_ lastTime: String?, now: Date) -> ShiftTiming {
+    /// 模板缺失时的兜底判定：当前时间早于该班首笔交易 → 未到交班点；
+    /// 否则末笔交易距今 > 90 分钟视为已交班。
+    private static func fallbackTiming(_ firstTime: String?, _ lastTime: String?, now: Date) -> ShiftTiming {
+        if let first = Fmt.parse(firstTime), now < first { return .notYet }
         guard let last = Fmt.parse(lastTime) else { return .unknown }
         return now.timeIntervalSince(last) > 90 * 60 ? .closed : .running
     }

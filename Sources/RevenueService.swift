@@ -11,6 +11,7 @@ enum RevenueService {
             let shifts = statusApplied(
                 aggregate.shifts,
                 template: aggregate.template,
+                facts: aggregate.facts,
                 date: date
             )
             return StationResult(

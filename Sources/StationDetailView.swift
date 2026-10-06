@@ -403,8 +403,10 @@ struct StationDetailView: View {
     private func shareOilImage() {
         guard let products = result?.products, !products.isEmpty else { return }
         do {
-            let url = try OilCardImage.render(products)
-            exportItems = [url]
+            // 直接分享 UIImage：系统同步拿到图片数据，预览立即可见，
+            // 避免首次弹出时文件 URL 的 QuickLook 预览尚未加载导致的空白
+            let image = try OilCardImage.renderImage(products)
+            exportItems = [image]
             showShare = true
         } catch {
             alert = AlertPayload(title: "生成失败", message: error.localizedDescription)

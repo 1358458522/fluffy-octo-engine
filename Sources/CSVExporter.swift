@@ -161,10 +161,12 @@ enum CSVExporter {
     }
 }
 
-/// 「按油品升数」白底小卡片 PNG（只含各油品升数，不含站名与日期），供系统分享面板发送
+/// 「按油品升数」白底小卡片（只含各油品升数，不含站名与日期），供系统分享面板发送
 enum OilCardImage {
 
-    static func render(_ products: [ProductStat]) throws -> URL {
+    /// 直接渲染 UIImage：分享时作为 activityItems 同步提供给 UIActivityViewController，
+    /// 系统立即拿到图片数据，预览立即可见，不依赖文件 URL 的异步 QuickLook 预览。
+    static func renderImage(_ products: [ProductStat]) throws -> UIImage {
         guard !products.isEmpty else {
             throw NSError(domain: "OilCardImage", code: 1,
                           userInfo: [NSLocalizedDescriptionKey: "没有可分享的油品数据"])
@@ -184,7 +186,7 @@ enum OilCardImage {
         let valueFont = UIFont.monospacedDigitSystemFont(ofSize: 30, weight: .semibold)
 
         let renderer = UIGraphicsImageRenderer(size: CGSize(width: width, height: height))
-        let image = renderer.image { ctx in
+        return renderer.image { ctx in
             UIColor.white.setFill()
             ctx.fill(CGRect(x: 0, y: 0, width: width, height: height))
 
@@ -212,6 +214,11 @@ enum OilCardImage {
                 )
             }
         }
+    }
+
+    /// 渲染并落盘 PNG（保留：与 CSV 导出同目录；当前小图分享已改为直接使用 renderImage 的 UIImage）
+    static func render(_ products: [ProductStat]) throws -> URL {
+        let image = try renderImage(products)
 
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent("ttyb-export", isDirectory: true)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)

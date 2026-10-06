@@ -428,8 +428,7 @@ enum DatabaseService {
                CONVERT(varchar(19), MIN(FOpenShiftTime), 120) AS open_t,
                CONVERT(varchar(19), MAX(FCloseShiftTime), 120) AS close_t
         FROM TFuelTradeShiftFIP WITH (NOLOCK)
-        WHERE FBusinessDate >= DATEADD(day, -1, CAST('\(date)' AS date))
-          AND FBusinessDate <= CAST('\(date)' AS date)
+        WHERE FBusinessDate = CAST('\(date)' AS date)
         GROUP BY FBusinessShiftNo
         ORDER BY FBusinessShiftNo
         """

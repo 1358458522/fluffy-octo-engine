@@ -12,6 +12,7 @@ enum RevenueService {
                 aggregate.shifts,
                 template: aggregate.template,
                 facts: aggregate.facts,
+                reports: aggregate.reports,
                 date: date
             )
             return StationResult(
@@ -107,46 +108,49 @@ enum RevenueService {
 
     // MARK: - 交班状态（与电脑端 judge_shift_status 同算法）
 
-    /// 给每个班次打上交班状态（事实判定优先，模板兜底）
+    /// 给每个班次打上交班状态（营业报表合计判定优先，事实辅助，模板兜底）
     static func statusApplied(
         _ shifts: [ShiftRevenue],
         template: ShiftTemplate?,
         facts: [Int: ShiftFact]?,
+        reports: [Int: ShiftReport]?,
         date: String,
         now: Date = Date()
     ) -> [ShiftRevenue] {
         shifts.map { shift in
             var item = shift
-            item.timing = judge(shift, template: template, facts: facts, date: date, now: now)
+            item.timing = judge(shift, template: template, facts: facts, reports: reports, date: date, now: now)
             return item
         }
     }
 
     /// 单班次交班判定：
-    /// 1) 有交班事实（TFuelTradeShiftFIP）：按实际开班 / 交班时刻判定；
-    /// 2) 事实缺失：回退到原模板近似判定（模板基准日时段平移到查询日）；
-    /// 3) 模板也缺失：末笔交易距今 > 90 分钟视为已交班（兜底，与电脑端一致）。
+    /// 1) 营业报表合计（TRptFuelProduct，权威）：合计有值（金额>0 或 次数>0）= 已交班；
+    /// 2) 报表无行 / 合计 0 空 = 未交班，用交班事实（TFuelTradeShiftFIP）区分营业中 / 未到交班点；
+    /// 3) 报表与事实均缺失：回退到原模板近似判定（模板基准日时段平移到查询日）；
+    /// 4) 模板也缺失：末笔交易距今 > 90 分钟视为已交班（兜底，与电脑端一致）。
     static func judge(
         _ shift: ShiftRevenue,
         template: ShiftTemplate?,
         facts: [Int: ShiftFact]?,
+        reports: [Int: ShiftReport]?,
         date: String,
         now: Date = Date()
     ) -> ShiftTiming {
-        // —— 事实判定（主用）——
+        // —— 报表证据判定（权威：营业报表合计有值 = 已交班）——
+        if let reports, let report = reports[shift.shift], report.amount > 0 || report.count > 0 {
+            return .closed
+        }
+
+        // —— 事实判定（辅助：仅用于区分未交班班次的进行状态）——
         if let facts, let fact = facts[shift.shift], let open = fact.open {
-            let close = fact.close
-            // close 有效（> open，真实交班时间）且已过交班点 + 3 分钟缓冲 → 已交班
-            if let close, close > open, now >= close.addingTimeInterval(3 * 60) {
-                return .closed
-            }
-            // 已开班且未满足已交班 → 营业中
+            // 报表未写入合计且已开班 → 营业中（未交班）
             if now >= open { return .running }
             // 未到开班时间 → 未到交班点
             return .notYet
         }
 
-        // —— 模板近似判定（事实缺失时兜底）——
+        // —— 模板近似判定（报表与事实均缺失时兜底）——
         if let template,
            let window = template.windows[shift.shift],
            let refDay = Fmt.parseDay(template.refDate) {

@@ -32,8 +32,10 @@ struct DayAggregate {
     var pays: [PayStat] = []
     /// 班次时段模板（交班判定兜底用）
     var template: ShiftTemplate?
-    /// 交班事实（TFuelTradeShiftFIP 查询日聚合，交班判定主用）
+    /// 交班事实（TFuelTradeShiftFIP 查询日聚合，交班判定辅助）
     var facts: [Int: ShiftFact] = [:]
+    /// 营业报表班次合计（TRptFuelProduct 查询日聚合，交班判定权威）
+    var reports: [Int: ShiftReport] = [:]
 }
 
 /// 一个站点某营业日区间（含起止两端）的取数结果。
@@ -280,9 +282,12 @@ enum DatabaseService {
             // 班次时段模板（交班判定兜底）
             Diag.log("查询: 班次时段模板")
             aggregate.template = await shiftTemplate(client, date: date)
-            // 交班事实（TFuelTradeShiftFIP，交班判定主用）
+            // 交班事实（TFuelTradeShiftFIP，交班判定辅助）
             Diag.log("查询: 交班事实")
             aggregate.facts = await shiftFacts(client, date: date)
+            // 营业报表班次合计（TRptFuelProduct，交班判定权威）
+            Diag.log("查询: 营业报表合计")
+            aggregate.reports = await shiftReports(client, date: date)
             Diag.log("查询: 当日取数完成")
             return aggregate
         }
@@ -443,6 +448,31 @@ enum DatabaseService {
             )
         }
         return facts
+    }
+
+    /// 营业报表班次合计（TRptFuelProduct：交班结算后写入，已交班班次有行且有值）。
+    /// 查询失败或查无记录时返回空字典（无行 = 未交班，由上层按报表口径判定）。
+    private static func shiftReports(_ client: SQLServerClient, date: String) async -> [Int: ShiftReport] {
+        let sql = """
+        SELECT FShiftNo AS shiftNo,
+               CAST(ISNULL(SUM(FAmount), 0) AS float) AS amt,
+               ISNULL(SUM(FFuelCount), 0) AS cnt
+        FROM TRptFuelProduct WITH (NOLOCK)
+        WHERE FBusinessDate = CAST('\(date)' AS date)
+        GROUP BY FShiftNo
+        ORDER BY FShiftNo
+        """
+
+        var reports: [Int: ShiftReport] = [:]
+        guard let rows = try? await client.query(sql) else { return reports }
+        for row in rows {
+            let shift = row.column("shiftNo")?.int ?? 0
+            reports[shift] = ShiftReport(
+                amount: row.column("amt")?.double ?? 0,
+                count: row.column("cnt")?.int ?? 0
+            )
+        }
+        return reports
     }
 
     // MARK: - 逐笔明细（取消 500 笔上限）

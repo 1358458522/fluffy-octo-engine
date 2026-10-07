@@ -161,6 +161,16 @@ struct ShiftFact {
     var close: Date?
 }
 
+/// 营业报表班次合计（来自云库 TRptFuelProduct 报表表，按查询日+班次聚合）：
+/// 交班结算后报表表才会写入合计行——已交班班次合计有值（金额/次数 > 0），
+/// 未交班班次无行或合计为 0/空。作为交班判定的权威依据。
+struct ShiftReport {
+    /// 该班次营业报表金额合计
+    var amount: Double
+    /// 该班次营业报表次数合计
+    var count: Int
+}
+
 /// 一个站点的当日结果（全天口径）
 struct StationResult: Identifiable {
     let id: UUID

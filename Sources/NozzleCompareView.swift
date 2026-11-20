@@ -1,12 +1,15 @@
 import SwiftUI
 
-/// 加油记录对比：按「油品 + 枪号」对比两组营业日的交易金额，并给出金额占比。
+/// 加油记录对比：按「油品 + 枪号」对比「一个营业日」与「一个对比区间」的交易金额，并给出金额占比。
 /// 口径：交易金额 = 应收 FDueAmount（老库缺列时回退 FTradeAmount）；枪号 = FFipID。
 struct NozzleCompareView: View {
     let station: Station
 
     @State private var curDate: Date = Calendar.current.startOfDay(for: Date())
-    @State private var baseDate: Date = Calendar.current.date(
+    @State private var baseStart: Date = Calendar.current.date(
+        byAdding: .day, value: -7, to: Calendar.current.startOfDay(for: Date())
+    ) ?? Date()
+    @State private var baseEnd: Date = Calendar.current.date(
         byAdding: .day, value: -1, to: Calendar.current.startOfDay(for: Date())
     ) ?? Date()
     @State private var rows: [NozzleCompare] = []
@@ -14,21 +17,42 @@ struct NozzleCompareView: View {
     @State private var errorText: String?
 
     private var curText: String { Fmt.dateFormatter.string(from: curDate) }
-    private var baseText: String { Fmt.dateFormatter.string(from: baseDate) }
+    private var baseStartText: String { Fmt.dateFormatter.string(from: baseStart) }
+    private var baseEndText: String { Fmt.dateFormatter.string(from: baseEnd) }
 
-    /// 当期选择变化时，对比期自动跟随为「当期前一天」
+    /// 营业日变化时，对比区间自动整体平移为「该日之前 7 天 ~ 前一天」
     private var curBinding: Binding<Date> {
         Binding(
             get: { curDate },
             set: { newValue in
                 curDate = newValue
-                baseDate = Calendar.current.date(byAdding: .day, value: -1, to: newValue) ?? newValue
+                let cal = Calendar.current
+                baseEnd = cal.date(byAdding: .day, value: -1, to: newValue) ?? newValue
+                baseStart = cal.date(byAdding: .day, value: -7, to: newValue) ?? newValue
             }
         )
     }
 
-    private var baseBinding: Binding<Date> {
-        Binding(get: { baseDate }, set: { baseDate = $0 })
+    /// 区间开始不得晚于结束
+    private var baseStartBinding: Binding<Date> {
+        Binding(
+            get: { baseStart },
+            set: { newValue in
+                baseStart = newValue
+                if baseEnd < newValue { baseEnd = newValue }
+            }
+        )
+    }
+
+    /// 区间结束不得早于开始
+    private var baseEndBinding: Binding<Date> {
+        Binding(
+            get: { baseEnd },
+            set: { newValue in
+                baseEnd = newValue
+                if baseStart > newValue { baseStart = newValue }
+            }
+        )
     }
 
     /// 枪号数值（非纯数字排在最后）
@@ -64,14 +88,22 @@ struct NozzleCompareView: View {
     // MARK: - 查询条件
 
     private var querySection: some View {
-        Section {
-            DatePicker("当期营业日", selection: curBinding, displayedComponents: .date)
-            DatePicker("对比营业日", selection: baseBinding, displayedComponents: .date)
-        } header: {
-            Text("营业日")
-        } footer: {
-            Text("当期 \(curText)　对比 \(baseText)")
-                .font(.caption2)
+        Group {
+            Section {
+                DatePicker("日期", selection: curBinding, displayedComponents: .date)
+            } header: {
+                Text("营业日")
+            }
+
+            Section {
+                DatePicker("开始", selection: baseStartBinding, displayedComponents: .date)
+                DatePicker("结束", selection: baseEndBinding, displayedComponents: .date)
+            } header: {
+                Text("对比区间")
+            } footer: {
+                Text("当期 \(curText)　对比 \(baseStartText) ~ \(baseEndText)")
+                    .font(.caption2)
+            }
         }
     }
 
@@ -92,7 +124,7 @@ struct NozzleCompareView: View {
                 EmptyHint(
                     icon: "chart.bar.doc.horizontal",
                     title: "暂无对比数据",
-                    message: "所选营业日没有加油记录"
+                    message: "所选营业日与对比区间没有加油记录"
                 )
             } else {
                 headerRow
@@ -118,7 +150,7 @@ struct NozzleCompareView: View {
                 .disabled(isLoading)
             }
         } footer: {
-            Text("占比 = 当期交易金额 ÷ 对比期交易金额 × 100%，对比期为 0 时显示「—」。")
+            Text("交易金额 = 当期该营业日合计；交易金额2 = 对比区间合计。占比 = 当期 ÷ 区间合计 × 100%，区间为 0 时显示「—」。")
                 .font(.caption2)
         }
     }
@@ -205,8 +237,8 @@ struct NozzleCompareView: View {
                 station,
                 from: curText,
                 to: curText,
-                from2: baseText,
-                to2: baseText
+                from2: baseStartText,
+                to2: baseEndText
             )
             rows = result
         } catch {

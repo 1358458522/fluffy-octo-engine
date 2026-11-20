@@ -82,35 +82,48 @@ jobs:
               print(json.dumps(data, ensure_ascii=False)[:600])
               raise SystemExit(1)
 
-          certs = [c for c in data.get("data", [])
-                   if c["attributes"].get("certificateType") in ("IOS_DISTRIBUTION", "DISTRIBUTION")]
-          certs.sort(key=lambda c: c["attributes"].get("expirationDate") or "")
-          print("iOS 分发证书数量:", len(certs))
-          for c in certs:
-              a = c["attributes"]
-              print("-", c["id"], a.get("certificateType"), "|", a.get("displayName"), "| exp", a.get("expirationDate"))
-          others = [c for c in data.get("data", []) if c not in certs]
-          print("其它类型证书数量:", len(others))
-          for c in others:
-              a = c["attributes"]
-              print("-", c["id"], a.get("certificateType"), "|", a.get("displayName"), "| exp", a.get("expirationDate"))
+          items = data.get("data", [])
+          dist_types = ("IOS_DISTRIBUTION", "DISTRIBUTION")
+          dev_types = ("DEVELOPMENT", "IOS_DEVELOPMENT")
+
+          dist = [c for c in items if c["attributes"].get("certificateType") in dist_types]
+          dev = [c for c in items if c["attributes"].get("certificateType") in dev_types]
+          dev_api = [c for c in dev if "Created via API" in (c["attributes"].get("displayName") or "")]
+          dev_manual = [c for c in dev if c not in dev_api]
+
+          def show(tag, group):
+              print(tag, len(group))
+              for c in sorted(group, key=lambda c: c["attributes"].get("expirationDate") or ""):
+                  a = c["attributes"]
+                  print("  -", c["id"], a.get("certificateType"), "|", a.get("displayName"), "| exp", a.get("expirationDate"))
+
+          show("分发证书", dist)
+          show("开发证书(自动创建)", dev_api)
+          show("开发证书(人工创建, 不处理)", dev_manual)
 
           if action != "revoke":
               print("dry-run 结束，未做任何改动")
               raise SystemExit(0)
-          if len(certs) < 2:
-              print("分发证书不足 2 张，无需撤销")
+
+          targets = []
+          if len(dist) >= 2:
+              targets += sorted(dist, key=lambda c: c["attributes"].get("expirationDate") or "")[:-1]
+          if len(dev_api) >= 2:
+              targets += sorted(dev_api, key=lambda c: c["attributes"].get("expirationDate") or "")[:-1]
+
+          if not targets:
+              print("无需撤销：各类型证书数量均在上限内")
               raise SystemExit(0)
 
           failed = 0
-          for c in certs[:-1]:
+          for c in targets:
               st, payload = api("/v1/certificates/" + c["id"], "DELETE")
-              print("DELETE", c["id"], c["attributes"].get("displayName"), "status", st)
+              print("DELETE", c["id"], c["attributes"].get("certificateType"), c["attributes"].get("displayName"), "status", st)
               if st not in (200, 204):
                   failed += 1
                   print(json.dumps(payload, ensure_ascii=False)[:300])
           if failed:
               print("::error::有证书未删除成功，请检查权限或到开发者后台手动处理")
               raise SystemExit(1)
-          print("已保留最新一张分发证书，其余撤销完成")
+          print("撤销完成：分发证书保留最新 1 张；自动创建的开发证书保留最新 1 张；人工证书未动")
           PY

@@ -1,0 +1,116 @@
+name: ASC Certificates
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "dry-run 仅列出证书；revoke 删除最旧的 IOS 分发证书并保留最新一张"
+        required: true
+        default: "dry-run"
+        type: choice
+        options:
+          - dry-run
+          - revoke
+
+jobs:
+  certs:
+    name: Inspect or revoke iOS distribution certificates
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+      ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+      ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+      ACTION: ${{ inputs.action }}
+
+    steps:
+      - name: Check required secrets
+        run: |
+          set -eu
+          for n in ASC_KEY_ID ASC_ISSUER_ID ASC_KEY_P8; do
+            eval "v=\${$n}"
+            if [ -z "$v" ]; then echo "::error::缺少 Actions Secrets: $n"; exit 1; fi
+          done
+          echo "Secrets 齐全（不打印任何值）"
+
+      - name: Write App Store Connect API key
+        run: |
+          set -eu
+          KEY_PATH="$RUNNER_TEMP/AuthKey_${ASC_KEY_ID}.p8"
+          printf '%s' "$ASC_KEY_P8" | sed 's/\\n/\n/g' > "$KEY_PATH"
+          chmod 600 "$KEY_PATH"
+          echo "ASC_KEY_PATH=$KEY_PATH" >> "$GITHUB_ENV"
+
+      - name: Inspect / revoke certificates
+        run: |
+          set -eu
+          python3 -m pip install --quiet pyjwt cryptography
+          python3 - <<'PY'
+          import os, json, time, urllib.request, urllib.error
+          import jwt
+
+          kid = os.environ["ASC_KEY_ID"]
+          iss = os.environ["ASC_ISSUER_ID"]
+          action = os.environ.get("ACTION", "dry-run")
+          with open(os.environ["ASC_KEY_PATH"], "r", encoding="utf-8") as fh:
+              key = fh.read()
+
+          now = int(time.time())
+          token = jwt.encode(
+              {"iss": iss, "iat": now, "exp": now + 600, "aud": "appstoreconnect-v1"},
+              key, algorithm="ES256", headers={"kid": kid, "typ": "JWT"},
+          )
+          if isinstance(token, bytes):
+              token = token.decode()
+
+          def api(path, method="GET"):
+              req = urllib.request.Request("https://api.appstoreconnect.apple.com" + path, method=method)
+              req.add_header("Authorization", "Bearer " + token)
+              try:
+                  with urllib.request.urlopen(req, timeout=60) as resp:
+                      body = resp.read().decode()
+                      return resp.status, (json.loads(body) if body.strip() else {})
+              except urllib.error.HTTPError as exc:
+                  return exc.code, {"err": exc.read().decode()[:400]}
+              except Exception as exc:
+                  return 0, {"err": str(exc)[:200]}
+
+          status, data = api("/v1/certificates?limit=200")
+          print("LIST status:", status)
+          if status != 200:
+              print("::error::列出证书失败，可能是 API Key 角色权限不足（需要 Admin 或 Account Holder）")
+              print(json.dumps(data, ensure_ascii=False)[:600])
+              raise SystemExit(1)
+
+          certs = [c for c in data.get("data", [])
+                   if c["attributes"].get("certificateType") in ("IOS_DISTRIBUTION", "DISTRIBUTION")]
+          certs.sort(key=lambda c: c["attributes"].get("expirationDate") or "")
+          print("iOS 分发证书数量:", len(certs))
+          for c in certs:
+              a = c["attributes"]
+              print("-", c["id"], a.get("certificateType"), "|", a.get("displayName"), "| exp", a.get("expirationDate"))
+          others = [c for c in data.get("data", []) if c not in certs]
+          print("其它类型证书数量:", len(others))
+          for c in others:
+              a = c["attributes"]
+              print("-", c["id"], a.get("certificateType"), "|", a.get("displayName"), "| exp", a.get("expirationDate"))
+
+          if action != "revoke":
+              print("dry-run 结束，未做任何改动")
+              raise SystemExit(0)
+          if len(certs) < 2:
+              print("分发证书不足 2 张，无需撤销")
+              raise SystemExit(0)
+
+          failed = 0
+          for c in certs[:-1]:
+              st, payload = api("/v1/certificates/" + c["id"], "DELETE")
+              print("DELETE", c["id"], c["attributes"].get("displayName"), "status", st)
+              if st not in (200, 204):
+                  failed += 1
+                  print(json.dumps(payload, ensure_ascii=False)[:300])
+          if failed:
+              print("::error::有证书未删除成功，请检查权限或到开发者后台手动处理")
+              raise SystemExit(1)
+          print("已保留最新一张分发证书，其余撤销完成")
+          PY

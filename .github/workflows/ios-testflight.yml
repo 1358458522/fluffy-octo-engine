@@ -100,6 +100,65 @@ jobs:
             echo "::warning::未能校验 .p8 私钥格式，仍继续构建（若为密钥问题，archive 步骤会明确报错）"
           fi
 
+      - name: Prune excess signing certificates
+        # 自动签名在 CI 上会不断新建 Apple Development 证书，占满账号上限后
+        # archive 会报 "reached the maximum number of certificates"。
+        # 这里在归档前清理历史自动创建的多余证书，仅保留最新一张；
+        # 人工创建的证书一律不动。清理失败不阻断构建（仅告警）。
+        continue-on-error: true
+        run: |
+          set -eu
+          python3 -m pip install --quiet pyjwt cryptography
+          python3 - <<'PY'
+          import os, json, time, urllib.request, urllib.error
+          import jwt
+
+          kid = os.environ["ASC_KEY_ID"]
+          iss = os.environ["ASC_ISSUER_ID"]
+          with open(os.environ["ASC_KEY_PATH"], "r", encoding="utf-8") as fh:
+              key = fh.read()
+          now = int(time.time())
+          token = jwt.encode({"iss": iss, "iat": now, "exp": now + 600, "aud": "appstoreconnect-v1"},
+                             key, algorithm="ES256", headers={"kid": kid, "typ": "JWT"})
+          if isinstance(token, bytes):
+              token = token.decode()
+
+          def api(path, method="GET"):
+              req = urllib.request.Request("https://api.appstoreconnect.apple.com" + path, method=method)
+              req.add_header("Authorization", "Bearer " + token)
+              try:
+                  with urllib.request.urlopen(req, timeout=60) as resp:
+                      body = resp.read().decode()
+                      return resp.status, (json.loads(body) if body.strip() else {})
+              except urllib.error.HTTPError as exc:
+                  return exc.code, {"err": exc.read().decode()[:300]}
+
+          st, data = api("/v1/certificates?limit=200")
+          if st != 200:
+              print("::warning::无法读取证书列表（可能 API Key 权限不足），跳过清理")
+              raise SystemExit(0)
+
+          items = data.get("data", [])
+          dist = [c for c in items if c["attributes"].get("certificateType") in ("IOS_DISTRIBUTION", "DISTRIBUTION")]
+          dev_api = [c for c in items if c["attributes"].get("certificateType") in ("DEVELOPMENT", "IOS_DEVELOPMENT")
+                     and "Created via API" in (c["attributes"].get("displayName") or "")]
+          print("分发证书:", len(dist), "| 自动创建开发证书:", len(dev_api))
+
+          expired = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
+          def key_of(c):
+              return c["attributes"].get("expirationDate") or ""
+          targets = [c for c in dist if key_of(c) < expired]
+          if len(dev_api) >= 2:
+              targets += sorted(dev_api, key=key_of)[:-1]
+          if not targets:
+              print("无需清理")
+              raise SystemExit(0)
+          for c in targets:
+              code, _ = api("/v1/certificates/" + c["id"], "DELETE")
+              print("撤销", c["id"], c["attributes"].get("certificateType"), "->", code)
+          print("证书清理完成")
+          PY
+
       - name: Install XcodeGen
         run: brew install xcodegen
 

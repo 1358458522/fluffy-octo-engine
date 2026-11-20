@@ -714,6 +714,8 @@ enum DatabaseService {
         var productName: String = ""
         var fipID: String = ""
         var count: Int = 0
+    /// 当日 FExFlag = 1 的子集金额合计（对应电脑端「交易金额」口径）
+    var flagAmount: Double = 0
         var amount: Double = 0
         var paid: Double = 0
         var volume: Double = 0
@@ -741,6 +743,7 @@ enum DatabaseService {
                CAST(ISNULL(p.FProductName, '') AS nvarchar(100)) AS pName,
                CAST(t.FFipID AS nvarchar(50)) AS fip,
                COUNT(*) AS cnt,
+               CAST(ISNULL(SUM(CASE WHEN CAST(ISNULL(t.FExFlag, 0) AS int) = 1 THEN ISNULL(t.FDueAmount, 0) ELSE 0 END), 0) AS float) AS flagAmt,
                CAST(ISNULL(SUM(t.FDueAmount), 0) AS float) AS amt,
                CAST(ISNULL(SUM(t.FTradeAmount), 0) AS float) AS paid,
                CAST(ISNULL(SUM(t.FDueVolume), 0) AS float) AS vol
@@ -755,6 +758,7 @@ enum DatabaseService {
                CAST(ISNULL(p.FProductName, '') AS nvarchar(100)) AS pName,
                CAST(t.FFipID AS nvarchar(50)) AS fip,
                COUNT(*) AS cnt,
+               CAST(ISNULL(SUM(CASE WHEN CAST(ISNULL(t.FExFlag, 0) AS int) = 1 THEN ISNULL(t.FTradeAmount, 0) ELSE 0 END), 0) AS float) AS flagAmt,
                CAST(ISNULL(SUM(t.FTradeAmount), 0) AS float) AS amt,
                CAST(ISNULL(SUM(t.FTradeAmount), 0) AS float) AS paid,
                CAST(ISNULL(SUM(t.FTradeVolume), 0) AS float) AS vol
@@ -778,6 +782,7 @@ enum DatabaseService {
             cell.productName = (row.column("pName")?.string ?? "").trimmingCharacters(in: .whitespaces)
             cell.fipID = (row.column("fip")?.string ?? "").trimmingCharacters(in: .whitespaces)
             cell.count = row.column("cnt")?.int ?? 0
+            cell.flagAmount = row.column("flagAmt")?.double ?? 0
             cell.amount = row.column("amt")?.double ?? 0
             cell.paid = row.column("paid")?.double ?? 0
             cell.volume = row.column("vol")?.double ?? 0
@@ -787,6 +792,40 @@ enum DatabaseService {
         return cells
     }
 
+    /// 加油记录对比（单营业日）
+    /// 交易金额 = 当日 FExFlag = 1 子集合计；交易金额2 = 当日全量合计；结果按枪号数值升序。
+    static func fetchNozzleDay(_ station: Station, date: String) async throws -> [NozzleCompare] {
+        try await withClient(station) { client in
+            Diag.log("查询: 加油记录对比 营业日 \(date)")
+            let cells = await nozzleCells(client, from: date, to: date)
+            var list: [NozzleCompare] = []
+            list.reserveCapacity(cells.count)
+            for cell in cells.values {
+                var row = NozzleCompare()
+                row.productCode = cell.productCode
+                row.productName = cell.productName
+                row.fipID = cell.fipID
+                row.count = cell.count
+                row.paid = cell.paid
+                row.volume = cell.volume
+                row.amount = cell.flagAmount
+                row.amount2 = cell.amount
+                row.count2 = cell.count
+                row.paid2 = cell.paid
+                row.volume2 = cell.volume
+                list.append(row)
+            }
+            list.sort { lhs, rhs in
+                let l = Int(lhs.fipID.trimmingCharacters(in: .whitespaces)) ?? Int.max
+                let r = Int(rhs.fipID.trimmingCharacters(in: .whitespaces)) ?? Int.max
+                if l != r { return l < r }
+                if lhs.productCode != rhs.productCode { return lhs.productCode < rhs.productCode }
+                return lhs.fipID < rhs.fipID
+            }
+            Diag.log("加油记录对比完成：\(date) 共 \(list.count) 行")
+            return list
+        }
+    }
     /// 「加油记录对比」取数：当期区间与对比期区间各自独立查询后按「油品 + 枪号」合并。
     /// - Parameters:
     ///   - from/to: 当期交易营业日（含起止两端）

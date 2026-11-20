@@ -245,6 +245,44 @@ struct TradePage {
     var hasMore: Bool { offset + rows.count < total }
 }
 
+// MARK: - 加油记录对比（按油品 + 枪号，两组交易营业日）
+
+/// 「加油记录对比」一行：同一油品同一枪号在「当期」与「对比期」两组营业日上的汇总。
+/// 口径与电脑端同名界面一致：交易金额 = FTradeAmount，实收金额 = FPaid（不可用时回退交易金额），
+/// 交易升数 = FTradeVolume，次数 = 交易笔数；枪号取 FFipID（FNozzleID 为占位值不使用）。
+struct NozzleCompare: Identifiable, Hashable {
+    var id: String { "\(productCode)#\(fipID)" }
+    var productCode: String = ""
+    var productName: String = ""
+    var fipID: String = ""
+
+    // 当期
+    var count: Int = 0
+    var amount: Double = 0
+    var paid: Double = 0
+    var volume: Double = 0
+
+    // 对比期
+    var count2: Int = 0
+    var amount2: Double = 0
+    var paid2: Double = 0
+    var volume2: Double = 0
+
+    var productLabel: String { productName.isEmpty ? productCode : productName }
+    var nozzleLabel: String { fipID.isEmpty ? "—" : fipID }
+
+    /// 占比 = 当期 / 对比期 × 100；对比期为 0（或负）时返回 nil，界面显示「—」
+    static func ratio(_ current: Double, _ base: Double) -> Double? {
+        guard base > 0 else { return nil }
+        return current / base * 100
+    }
+
+    var amountRatio: Double? { NozzleCompare.ratio(amount, amount2) }
+    var paidRatio: Double? { NozzleCompare.ratio(paid, paid2) }
+    var volumeRatio: Double? { NozzleCompare.ratio(volume, volume2) }
+    var countRatio: Double? { NozzleCompare.ratio(Double(count), Double(count2)) }
+}
+
 // MARK: - 格式化
 
 enum Fmt {

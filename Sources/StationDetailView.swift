@@ -84,6 +84,7 @@ struct StationDetailView: View {
                 shiftSection
                 productSection
             }
+            compareEntrySection
             tradesSection
         }
         .listStyle(.insetGrouped)
@@ -566,6 +567,28 @@ struct StationDetailView: View {
     }
 
     // MARK: - 逐笔明细（不限笔数）
+
+    /// 「加油记录对比」入口：进入独立页面，按油品 + 枪号对比两组交易营业日
+    private var compareEntrySection: some View {
+        Section {
+            NavigationLink {
+                NozzleCompareView(station: station)
+            } label: {
+                HStack(spacing: 12) {
+                    Image(systemName: "arrow.left.arrow.right.square")
+                        .foregroundStyle(.tint)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("加油记录对比")
+                        Text("按油品 + 枪号对比两组营业日：金额 / 实收 / 升数 / 次数及占比")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
+        } header: {
+            Text("对比分析")
+        }
+    }
 
     private var tradesSection: some View {
         Section {

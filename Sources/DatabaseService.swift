@@ -705,4 +705,135 @@ enum DatabaseService {
         }
         return []
     }
+
+    // MARK: - 加油记录对比（按油品 + 枪号；两组营业日区间各自独立查询后合并）
+
+    /// 单组营业日区间内「油品 + 枪号」的聚合中间结果
+    struct NozzleCell {
+        var productCode: String = ""
+        var productName: String = ""
+        var fipID: String = ""
+        var count: Int = 0
+        var amount: Double = 0
+        var paid: Double = 0
+        var volume: Double = 0
+    }
+
+    private static func nozzleCellKey(_ product: String, _ fip: String) -> String {
+        "\(product)|\(fip)"
+    }
+
+    /// 单组区间「按油品 + 枪号」汇总（一条 SQL，只读）。
+    /// 口径对齐电脑端营业报表（TRptFuelProduct 的 FAmount / FFinalAmount，交易表回退时同构）：
+    /// 交易金额 = FDueAmount（应收金额）、实收金额 = FTradeAmount（成交金额）、
+    /// 交易升数 = FDueVolume、次数 = 交易笔数、枪号 = FFipID（FNozzleID 为占位值不使用）。
+    /// 注意 FPaid 是「是否已付」整型标志、FMakeout 是挂账标志，均不是金额列，不可用于实收金额。
+    /// 老库缺 FDueAmount / FDueVolume 时自动回退：两者均按 FTradeAmount / FTradeVolume 统计。
+    private static func nozzleCells(
+        _ client: SQLServerClient,
+        from: String,
+        to: String
+    ) async -> [String: NozzleCell] {
+        let range = "t.FBusinessDate >= '\(from)' AND t.FBusinessDate <= '\(to)'"
+
+        let dueSQL = """
+        SELECT CAST(t.FProductSN AS nvarchar(50)) AS pSn,
+               CAST(ISNULL(p.FProductName, '') AS nvarchar(100)) AS pName,
+               CAST(t.FFipID AS nvarchar(50)) AS fip,
+               COUNT(*) AS cnt,
+               CAST(ISNULL(SUM(t.FDueAmount), 0) AS float) AS amt,
+               CAST(ISNULL(SUM(t.FTradeAmount), 0) AS float) AS paid,
+               CAST(ISNULL(SUM(t.FDueVolume), 0) AS float) AS vol
+        FROM TFuelTradeRecord t WITH (NOLOCK)
+        LEFT JOIN TProduct p WITH (NOLOCK) ON p.FProductSN = t.FProductSN
+        WHERE \(range)
+        GROUP BY t.FProductSN, t.FFipID, p.FProductName
+        """
+
+        let fallbackSQL = """
+        SELECT CAST(t.FProductSN AS nvarchar(50)) AS pSn,
+               CAST(ISNULL(p.FProductName, '') AS nvarchar(100)) AS pName,
+               CAST(t.FFipID AS nvarchar(50)) AS fip,
+               COUNT(*) AS cnt,
+               CAST(ISNULL(SUM(t.FTradeAmount), 0) AS float) AS amt,
+               CAST(ISNULL(SUM(t.FTradeAmount), 0) AS float) AS paid,
+               CAST(ISNULL(SUM(t.FTradeVolume), 0) AS float) AS vol
+        FROM TFuelTradeRecord t WITH (NOLOCK)
+        LEFT JOIN TProduct p WITH (NOLOCK) ON p.FProductSN = t.FProductSN
+        WHERE \(range)
+        GROUP BY t.FProductSN, t.FFipID, p.FProductName
+        """
+
+        let dueRows = try? await client.query(dueSQL)
+        var rows = dueRows ?? []
+        if dueRows == nil {
+            Diag.log("应收列 FDueAmount/FDueVolume 不可用，交易金额与升数回退 FTradeAmount/FTradeVolume：\(from)~\(to)")
+            rows = (try? await client.query(fallbackSQL)) ?? []
+        }
+
+        var cells: [String: NozzleCell] = [:]
+        for row in rows {
+            var cell = NozzleCell()
+            cell.productCode = (row.column("pSn")?.string ?? "").trimmingCharacters(in: .whitespaces)
+            cell.productName = (row.column("pName")?.string ?? "").trimmingCharacters(in: .whitespaces)
+            cell.fipID = (row.column("fip")?.string ?? "").trimmingCharacters(in: .whitespaces)
+            cell.count = row.column("cnt")?.int ?? 0
+            cell.amount = row.column("amt")?.double ?? 0
+            cell.paid = row.column("paid")?.double ?? 0
+            cell.volume = row.column("vol")?.double ?? 0
+            cells[nozzleCellKey(cell.productCode, cell.fipID)] = cell
+        }
+        Diag.log("按油品+枪号汇总 \(from)~\(to)：\(cells.count) 行")
+        return cells
+    }
+
+    /// 「加油记录对比」取数：当期区间与对比期区间各自独立查询后按「油品 + 枪号」合并。
+    /// - Parameters:
+    ///   - from/to: 当期交易营业日（含起止两端）
+    ///   - from2/to2: 对比期交易营业日（含起止两端）
+    static func fetchNozzleCompare(
+        _ station: Station,
+        from: String,
+        to: String,
+        from2: String,
+        to2: String
+    ) async throws -> [NozzleCompare] {
+        try await withClient(station) { client in
+            Diag.log("查询: 加油记录对比 当期 \(from)~\(to) / 对比期 \(from2)~\(to2)")
+            let currentMap = await nozzleCells(client, from: from, to: to)
+            let baseMap = await nozzleCells(client, from: from2, to: to2)
+
+            var keys = Set(currentMap.keys)
+            keys.formUnion(baseMap.keys)
+
+            let merged: [NozzleCompare] = keys.map { key in
+                let current = currentMap[key] ?? NozzleCell()
+                let base = baseMap[key] ?? NozzleCell()
+                return NozzleCompare(
+                    productCode: current.productCode.isEmpty ? base.productCode : current.productCode,
+                    productName: current.productName.isEmpty ? base.productName : current.productName,
+                    fipID: current.fipID.isEmpty ? base.fipID : current.fipID,
+                    count: current.count,
+                    amount: current.amount,
+                    paid: current.paid,
+                    volume: current.volume,
+                    count2: base.count,
+                    amount2: base.amount,
+                    paid2: base.paid,
+                    volume2: base.volume
+                )
+            }
+
+            let sorted = merged.sorted { lhs, rhs in
+                if lhs.productCode != rhs.productCode { return lhs.productCode < rhs.productCode }
+                let l = Int(lhs.fipID) ?? Int.max
+                let r = Int(rhs.fipID) ?? Int.max
+                if l != r { return l < r }
+                return lhs.fipID < rhs.fipID
+            }
+            Diag.log("加油记录对比完成：当期 \(currentMap.count) 行 / 对比期 \(baseMap.count) 行 / 合并 \(sorted.count) 行")
+            return sorted
+        }
+    }
+
 }

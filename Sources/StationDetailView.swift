@@ -579,7 +579,7 @@ struct StationDetailView: View {
                         .foregroundStyle(.tint)
                     VStack(alignment: .leading, spacing: 2) {
                         Text("加油记录对比")
-                        Text("按油品 + 枪号对比两组营业日：金额 / 实收 / 升数 / 次数及占比")
+                        Text("按油品 + 枪号对比两组营业日的交易金额与占比")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }

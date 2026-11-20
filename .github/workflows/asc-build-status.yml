@@ -1,0 +1,44 @@
+name: ASC Build Status
+
+on:
+  workflow_dispatch:
+
+jobs:
+  status:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+      ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+      ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+    steps:
+      - name: Query latest builds
+        run: |
+          set -eu
+          KEY="$RUNNER_TEMP/k.p8"
+          printf '%s' "$ASC_KEY_P8" | sed 's/\\n/\n/g' > "$KEY"
+          python3 -m pip install --quiet pyjwt cryptography
+          export ASC_KEY_PATH="$KEY"
+          python3 - <<'PY'
+          import os, json, time, urllib.request, urllib.error
+          import jwt
+          kid=os.environ["ASC_KEY_ID"]; iss=os.environ["ASC_ISSUER_ID"]
+          key=open(os.environ["ASC_KEY_PATH"],encoding="utf-8").read()
+          now=int(time.time())
+          t=jwt.encode({"iss":iss,"iat":now,"exp":now+600,"aud":"appstoreconnect-v1"},key,algorithm="ES256",headers={"kid":kid,"typ":"JWT"})
+          if isinstance(t,bytes): t=t.decode()
+          def api(p):
+              r=urllib.request.Request("https://api.appstoreconnect.apple.com"+p)
+              r.add_header("Authorization","Bearer "+t)
+              try:
+                  with urllib.request.urlopen(r,timeout=60) as resp:
+                      return resp.status, json.loads(resp.read().decode())
+              except urllib.error.HTTPError as e:
+                  return e.code, {"err": e.read().decode()[:300]}
+          st,d=api("/v1/builds?limit=5&sort=-uploadedDate")
+          print("builds status", st)
+          for b in d.get("data",[]):
+              a=b["attributes"]
+              print("-", a.get("version"), "build", a.get("buildNumber"), "| state", a.get("processingState"), "| expired", a.get("expired"), "| uploaded", a.get("uploadedDate"))
+          if st!=200: print(json.dumps(d,ensure_ascii=False)[:400])
+          PY
